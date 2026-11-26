@@ -1597,6 +1597,40 @@ impl App {
         self.config.scale = scale.clamp(config::MIN_SCALE as i32, config::MAX_SCALE as i32) as u32;
     }
 
+    /// Whether key `k` with modifiers `m` is Shift+C=, pressed in either
+    /// order: Shift with C= held, or C= with Shift held.
+    fn is_shift_commodore(&self, k: Keycode, m: Mod) -> bool {
+        let c = self.config.commodore_key;
+        let cbm_key = match (c.alt, c.right) {
+            (false, false) => Keycode::LCTRL,
+            (false, true) => Keycode::RCTRL,
+            (true, false) => Keycode::LALT,
+            (true, true) => Keycode::RALT,
+        };
+        let shift = Mod::LSHIFTMOD | Mod::RSHIFTMOD;
+        (matches!(k, Keycode::LSHIFT | Keycode::RSHIFT) && m.intersects(self.commodore_mod()))
+            || (k == cbm_key && m.intersects(shift))
+    }
+
+    /// Shift+C=: switch character set. Inside quotes, or with CTRL held,
+    /// also type the code that switches to it ($0E Mixed case, $8E
+    /// Graphics on the Commodores), as a program would PRINT it.
+    fn shift_commodore(&mut self, ctrl: bool, layout: &Layout) {
+        let m = self.sys.machine.as_ref();
+        let next = (m.charset() + 1) % m.charsets().len();
+        let cur = self.editor.doc.cursor();
+        let quoted = attrs::in_quotes(m, self.editor.doc.line(cur.line), cur.col);
+        if (ctrl || quoted)
+            && let Some(code) = m.charset_code(next)
+        {
+            self.editor
+                .apply(EditAction::Insert(code), layout, m, false);
+        }
+        self.set_charset(next);
+        let m = &self.sys.machine;
+        self.message = Some(format!("{} character set", m.charsets()[m.charset()]));
+    }
+
     /// Show the `i`th system (in menu order) in this window. The document
     /// stays as it is; it's drawn and typed in the new system's way, with
     /// that system's own settings (colours, character set, fonts, line
@@ -3431,7 +3465,13 @@ impl App {
             return false;
         }
 
-        // Alt+letter opens a menu (unless Alt is the Atari CONTROL key).
+        // Shift+C= switches the character set, as on the C64.
+        if self.is_shift_commodore(k, m) {
+            self.shift_commodore(machine_ctrl, layout);
+            return false;
+        }
+
+        // Alt+letter opens a menu (unless Alt is the CTRL or C= key).
         if alt {
             let c = char::from_u32(k.into_i32() as u32).unwrap_or('\0');
             if let Some(i) = self

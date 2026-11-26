@@ -605,7 +605,7 @@ impl App {
              F5  Show / hide colour and reverse codes (outside quotes)\n\
              Shift+F5  Highlight control codes in a colour of their own\n\
              F6  Colour and reverse codes act on the text, or not\n\
-             F7  Graphics / Mixed case character set\n\
+             F7 or Shift+C=  Graphics / Mixed case character set\n\
              F9  Preferences\n\
              F10  Menus\n\
              \n\

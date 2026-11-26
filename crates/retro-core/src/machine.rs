@@ -76,6 +76,13 @@ pub trait Machine {
     /// mapping; the codes in the document never change.
     fn set_charset(&mut self, _index: usize) {}
 
+    /// The code that switches the screen to character set `index`
+    /// (typed into the text when the set is switched inside quotes or
+    /// with CTRL held), if the machine has one.
+    fn charset_code(&self, _index: usize) -> Option<u8> {
+        None
+    }
+
     /// Code of the blank (space) character.
     fn space(&self) -> u8;
 

@@ -80,8 +80,11 @@ const C64_HELP: &[&str] = &[
     "",
     "Keys with no C64 equivalent ({ }) are ignored.",
     "",
-    "F7 switches between the Graphics and Mixed case",
-    "character sets, as Shift+C= does on the C64.",
+    "Shift+C= (or F7) switches between the Graphics",
+    "and Mixed case character sets. In quotes, or with",
+    "CTRL held too, it also types the code that",
+    "switches: {$0E} to Mixed case (CTRL+N types it",
+    "too), {$8E} to Graphics.",
 ];
 
 /// The VIC-20 for now: the C64's keys (its own come in a later step).
@@ -97,8 +100,11 @@ const VIC20_HELP: &[&str] = &[
     "                no others for text)",
     "CTRL+9 and 0    RVS ON, RVS OFF",
     "",
-    "F7 switches between the Graphics and Mixed case",
-    "character sets, as Shift+C= does on the VIC-20.",
+    "Shift+C= (or F7) switches between the Graphics",
+    "and Mixed case character sets. In quotes, or with",
+    "CTRL held too, it also types the code that",
+    "switches: {$0E} to Mixed case (CTRL+N types it",
+    "too), {$8E} to Graphics.",
 ];
 
 /// Copyright notice details, for About and Licensing.

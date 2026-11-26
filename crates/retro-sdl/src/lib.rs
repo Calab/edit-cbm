@@ -276,8 +276,9 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
         app.menu.context = Some((x, y));
     }
     // Keys, as if typed: ^X is Ctrl+X, \n is Enter, { } Ctrl+Left/Right,
-    // [ ] Ctrl+Shift+Left/Right, |x right Ctrl+x, ¬x left Alt+x, anything
-    // else is typed (key down, then its text).
+    // [ ] Ctrl+Shift+Left/Right, |x right Ctrl+x, ¬x left Alt+x, § Shift+
+    // left Alt (¶ with right Ctrl too), anything else is typed (key down,
+    // then its text).
     if let Ok(keys) = std::env::var("RETRO_EDITOR_KEYS") {
         use sdl2::keyboard::{Keycode, Mod};
         let mut chars = keys.chars();
@@ -295,6 +296,15 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
                 }
                 '\n' => {
                     app.key_down(Keycode::RETURN, Mod::NOMOD, &ctx);
+                }
+                // §: Shift pressed with left Alt held (Shift+C=); ¶: the
+                // same with right Ctrl held too.
+                '§' | '¶' => {
+                    let mut m = Mod::LALTMOD | Mod::LSHIFTMOD;
+                    if c == '¶' {
+                        m |= Mod::RCTRLMOD;
+                    }
+                    app.key_down(Keycode::LSHIFT, m, &ctx);
                 }
                 // |x: right Ctrl+x, ¬x: left Alt+x (by default the CTRL
                 // and C= keys).

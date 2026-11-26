@@ -72,6 +72,18 @@ fn scan(machine: &dyn Machine, line: &[u8], start: Attr) -> (Vec<Attr>, Attr, Op
     (out, outer, inner)
 }
 
+/// Whether byte `col` of `line` is between quotes (quote mode ends with
+/// the line, so only the line matters).
+pub fn in_quotes(machine: &dyn Machine, line: &[u8], col: usize) -> bool {
+    let quote = machine.quote_code();
+    line[..col.min(line.len())]
+        .iter()
+        .filter(|&&b| Some(b) == quote)
+        .count()
+        % 2
+        == 1
+}
+
 /// The colour and reverse a character typed at `pos` would get.
 pub fn state_at(machine: &dyn Machine, lines: &[Vec<u8>], pos: Pos) -> Attr {
     let line = &lines[pos.line];

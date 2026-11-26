@@ -162,6 +162,16 @@ impl Machine for Cbm {
         petscii::is_control(code)
     }
 
+    /// $8E switches to Graphics (upper case and graphics), $0E to Mixed
+    /// case: CHR$(142) and CHR$(14), CTRL+N on the keyboard.
+    fn charset_code(&self, index: usize) -> Option<u8> {
+        Some(if index == MIXED_CASE {
+            petscii::TO_MIXED_CASE
+        } else {
+            petscii::TO_GRAPHICS
+        })
+    }
+
     fn quote_code(&self) -> Option<u8> {
         Some(b'"')
     }
@@ -363,6 +373,19 @@ mod tests {
         assert_eq!(m.code_effect(0x9E), Some(CodeEffect::Colour(7))); // yellow
         assert_eq!(m.code_effect(0x81), None); // no orange code
         assert_eq!(m.effect_code(CodeEffect::Colour(8)), None);
+    }
+
+    #[test]
+    fn case_switch_codes_and_quotes() {
+        use retro_core::attrs::in_quotes;
+        let m = Cbm::new(&model::C64);
+        assert_eq!(m.charset_code(MIXED_CASE), Some(0x0E));
+        assert_eq!(m.charset_code(0), Some(0x8E));
+        let line = b"10 PRINT\"AB\"C";
+        assert!(!in_quotes(&m, line, 8));
+        assert!(in_quotes(&m, line, 9));
+        assert!(in_quotes(&m, line, 11));
+        assert!(!in_quotes(&m, line, 12));
     }
 
     #[test]
