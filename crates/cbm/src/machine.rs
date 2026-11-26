@@ -36,15 +36,21 @@ impl Cbm {
         self.model
     }
 
-    /// Use a character ROM (4096 bytes: Graphics then Mixed case) as the
-    /// built-in sets. For development only: the ROM is Commodore's, so it
-    /// is read from a file when the program starts, never built in.
+    /// Use a character ROM (Graphics then Mixed case: 4096 bytes, or the
+    /// PET's 2048) as the built-in sets. For development only: the ROM is
+    /// Commodore's, so it is read from a file when the program starts,
+    /// never built in.
     pub fn set_builtin_rom(&mut self, rom: &[u8]) -> Result<(), String> {
-        if rom.len() != 4096 {
-            return Err(format!("{} bytes; a character ROM is 4096", rom.len()));
+        let size = if self.model.rom_reversed { 4096 } else { 2048 };
+        if rom.len() != size {
+            return Err(format!(
+                "{} bytes; a {} character ROM is {size}",
+                rom.len(),
+                self.model.name
+            ));
         }
         for (i, set) in self.builtin.iter_mut().enumerate() {
-            *set = font::set_from_rom(rom, i)?;
+            *set = font::set_from_rom(rom, i, self.model.rom_reversed)?;
         }
         Ok(())
     }
@@ -62,13 +68,14 @@ impl Cbm {
 /// The clipboard character for a code: ASCII where PETSCII has the same
 /// character, £ ↑ ← for $5C $5E $5F, and U+E000 + code for the rest. In
 /// Mixed case, $41-$5A are lower case and $C1-$DA capitals.
-pub fn char_for_code(code: u8, mixed: bool) -> char {
+pub fn char_for_code(code: u8, mixed: bool, pound: bool) -> char {
     match code {
         0x20..=0x40 | 0x5B | 0x5D => code as char,
         0x41..=0x5A if mixed => (code + 0x20) as char,
         0x41..=0x5A => code as char,
         0xC1..=0xDA if mixed => (code - 0x80) as char,
-        0x5C => '£',
+        0x5C if pound => '£',
+        0x5C => '\\',
         0x5E => '↑',
         0x5F => '←',
         _ => char::from_u32(0xE000 + u32::from(code)).unwrap(),
@@ -78,13 +85,14 @@ pub fn char_for_code(code: u8, mixed: bool) -> char {
 /// The code for a clipboard character, if the C64 has it. Letters of
 /// either case type the set's own letters: in the Graphics set, which has
 /// no lower case, `a` is read as `A`.
-pub fn code_for_char(c: char, mixed: bool) -> Option<u8> {
+pub fn code_for_char(c: char, mixed: bool, pound: bool) -> Option<u8> {
     Some(match c {
         ' '..='@' | '[' | ']' => c as u8,
         'a'..='z' => c as u8 - 0x20,
         'A'..='Z' if mixed => c as u8 + 0x80,
         'A'..='Z' => c as u8,
-        '£' => 0x5C,
+        '£' if pound => 0x5C,
+        '\\' if !pound => 0x5C,
         '↑' => 0x5E,
         '←' => 0x5F,
         _ => match c as u32 {
@@ -111,7 +119,10 @@ impl Machine for Cbm {
 
     fn load_font(&mut self, charset: usize, file: Option<&[u8]>) -> Result<(), String> {
         let slot = self.fonts.get_mut(charset).ok_or("no such character set")?;
-        *slot = file.map(|f| font::set_from_rom(f, charset)).transpose()?;
+        let reversed = self.model.rom_reversed;
+        *slot = file
+            .map(|f| font::set_from_rom(f, charset, reversed))
+            .transpose()?;
         Ok(())
     }
 
@@ -129,6 +140,10 @@ impl Machine for Cbm {
 
     fn space(&self) -> u8 {
         b' '
+    }
+
+    fn narrow_pixels(&self) -> bool {
+        self.model.narrow
     }
 
     fn screen_columns(&self) -> usize {
@@ -191,11 +206,11 @@ impl Machine for Cbm {
     }
 
     fn char_for_code(&self, code: u8) -> char {
-        char_for_code(code, self.mixed())
+        char_for_code(code, self.mixed(), self.model.pound)
     }
 
     fn code_for_char(&self, c: char) -> Option<u8> {
-        code_for_char(c, self.mixed())
+        code_for_char(c, self.mixed(), self.model.pound)
     }
 
     /// As on the clipboard, with `?` (counted) for characters outside
@@ -309,8 +324,8 @@ mod tests {
         // The colour codes are the ones the keyboard types.
         use crate::keyboard::{commodore_code, control_code};
         let typed: Vec<u8> = ('1'..='8')
-            .filter_map(control_code)
-            .chain(('1'..='8').filter_map(|c| commodore_code(c, false)))
+            .filter_map(|c| control_code(&model::C64, c))
+            .chain(('1'..='8').filter_map(|c| commodore_code(&model::C64, c, false)))
             .collect();
         assert_eq!(typed, petscii::COLOUR_CODES);
     }
@@ -386,6 +401,30 @@ mod tests {
         assert!(in_quotes(&m, line, 9));
         assert!(in_quotes(&m, line, 11));
         assert!(!in_quotes(&m, line, 12));
+    }
+
+    #[test]
+    fn the_pet() {
+        use retro_core::clipboard::{from_text, to_text};
+        let mut m = Cbm::new(&model::PET);
+        // $5C is a backslash, both ways, in either set.
+        for set in [0, MIXED_CASE] {
+            m.set_charset(set);
+            assert_eq!(to_text(&[vec![0x5C]], &m), "\\");
+            assert_eq!(from_text("\\", &m).0, vec![vec![0x5C]]);
+        }
+        // No colours: only RVS acts.
+        assert_eq!(m.code_effect(0x1C), None);
+        assert_eq!(m.code_effect(0x12), Some(CodeEffect::ReverseOn));
+        // Its ROM: two plain sets of 1024.
+        let mut rom = vec![0u8; 2048];
+        rom[1024 + 8] = 0x77;
+        m.set_builtin_rom(&rom).unwrap();
+        assert_eq!(m.charset_glyph(MIXED_CASE, b'A')[0], 0x77);
+        assert!(m.set_builtin_rom(&[0; 4096]).is_err());
+        assert!(!m.narrow_pixels());
+        assert!(Cbm::new(&model::PET8032).narrow_pixels());
+        assert_eq!(Cbm::new(&model::PET8032).screen_columns(), 80);
     }
 
     #[test]

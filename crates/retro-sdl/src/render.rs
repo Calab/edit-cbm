@@ -29,6 +29,10 @@ pub struct Palette {
 #[derive(Clone, Copy)]
 pub struct ColorModel {
     pub hues: u8,
+    /// How many of the hues text and the border can use (the VIC-20's
+    /// characters and border have 8 of its 16 colours).
+    pub text_hues: u8,
+    pub border_hues: u8,
     pub lums: u8,
     /// How luminance is numbered for display (2 on the Atari: 0, 2 ... 14).
     pub lum_step: u8,
@@ -70,11 +74,15 @@ pub fn build_atlas<'a>(
     Ok(tex)
 }
 
-/// Draws cells on a grid of `cell`-pixel squares, offset by `origin_x`.
+/// Draws cells on a grid of `cell_w` x `cell` pixels, offset by
+/// `origin_x`. (Cells are square except for 80-column screens, whose
+/// characters are half as wide.)
 pub struct Grid<'c, 't> {
     pub canvas: &'c mut Canvas<Window>,
     pub atlas: &'c mut Texture<'t>,
+    /// Cell height.
     pub cell: u32,
+    pub cell_w: u32,
     pub origin_x: i32,
     /// Y pixel of row 0 (below the menu bar).
     pub origin_y: i32,
@@ -83,9 +91,9 @@ pub struct Grid<'c, 't> {
 impl Grid<'_, '_> {
     fn rect(&self, col: usize, row: usize, cols: usize) -> Rect {
         Rect::new(
-            self.origin_x + (col as u32 * self.cell) as i32,
+            self.origin_x + (col as u32 * self.cell_w) as i32,
             self.origin_y + (row as u32 * self.cell) as i32,
-            self.cell * cols as u32,
+            self.cell_w * cols as u32,
             self.cell,
         )
     }

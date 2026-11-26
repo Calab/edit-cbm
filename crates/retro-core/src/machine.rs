@@ -109,6 +109,12 @@ pub trait Machine {
         None
     }
 
+    /// Whether characters are drawn half as wide as they're tall (an
+    /// 80-column screen), all 8 columns of each still shown.
+    fn narrow_pixels(&self) -> bool {
+        false
+    }
+
     /// Native screen width in characters (40 for both Atari and C64).
     fn screen_columns(&self) -> usize;
 

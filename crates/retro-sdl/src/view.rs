@@ -38,13 +38,14 @@ impl App {
             let _ = canvas.fill_rect(Rect::new(
                 f.origin_x,
                 f.text_top,
-                screen_cols as u32 * f.cell,
+                screen_cols as u32 * f.cell_w,
                 f.layout.rows as u32 * f.cell,
             ));
             let mut grid = Grid {
                 canvas,
                 atlas,
                 cell: f.cell,
+                cell_w: f.cell_w,
                 origin_x: f.origin_x,
                 origin_y: f.text_top,
             };
@@ -170,7 +171,7 @@ impl App {
             return None;
         }
         let cell = f.cell as i32;
-        let x = |col: usize| f.origin_x + (layout.left_margin + col) as i32 * cell;
+        let x = |col: usize| f.origin_x + (layout.left_margin + col) as i32 * f.cell_w as i32;
         let y = |row: usize| f.text_top + (row as i32 - top as i32) * cell;
         // One row: just the text; several: the full width of those rows.
         let (x0, x1) = if row_a == row_b {
@@ -221,6 +222,7 @@ impl App {
             canvas,
             atlas,
             cell: cell as u32,
+            cell_w: cell as u32,
             origin_x: r.x(),
             origin_y: r.y(),
         };

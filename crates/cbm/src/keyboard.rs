@@ -1,8 +1,18 @@
 //! The Commodore keyboard on a PC keyboard.
 //!
-//! The codes come from the C64 KERNAL's own keyboard tables (normal,
-//! Shift, C= and CTRL, at $EB81-$ECB8), so each key types what the C64's
-//! key does.
+//! The codes come from the KERNALs' own keyboard tables (C64: normal,
+//! Shift, C= and CTRL at $EB81-$ECB8; VIC-20: $EC5E, $EC9F, $ECE0 and
+//! $EDA3), so each key types what the machine's key does. The VIC-20
+//! differs only in CTRL, which types nothing with letters and £ ; : = @
+//! ↑, and in C=+1-8, which type the shifted digit (it has no more
+//! colours).
+//!
+//! The PET's graphics keyboard (from the 4.0 editor ROM's key table) has
+//! no CTRL or C= key: Shift with any key types a graphic (its code +
+//! $80). Typing follows the PC layout; the C= key (left Alt) plus a key
+//! types the graphic on the PET key showing that character (Alt+1 the
+//! one on `1`, Alt+Shift+1 the one on `!`). Tab is the RVS key (RVS ON;
+//! with Shift, RVS OFF), and CTRL+Tab the next tab stop.
 //!
 //! * Typing follows the PC layout. Unshifted letters type $41-$5A and
 //!   shifted ones $C1-$DA, as on the C64: capitals and graphics in the
@@ -20,10 +30,13 @@
 
 use retro_core::{EditAction, Key, KeyInput, KeyboardRules};
 
+use crate::model::{Keys, Model};
 use crate::petscii::CR;
 
-#[derive(Debug, Default, Clone)]
-pub struct CbmKeyboard;
+#[derive(Debug, Clone)]
+pub struct CbmKeyboard {
+    model: &'static Model,
+}
 
 /// C= plus A-Z.
 const COMMODORE_LETTERS: [u8; 26] = [
@@ -56,8 +69,64 @@ pub fn printable(c: char) -> Option<u8> {
     })
 }
 
-/// CTRL plus a key (its unshifted character).
-pub fn control_code(c: char) -> Option<u8> {
+/// A printable PC character on the PET: as on the C64, except that $5C
+/// is a backslash, and the PET's shifted graphics on `\ - [ ]` come from
+/// `| _ { }`.
+pub fn pet_printable(c: char) -> Option<u8> {
+    Some(match c {
+        '|' => 0xDC,
+        '_' => 0xAD,
+        '{' => 0xDB,
+        '}' => 0xDD,
+        _ => return printable(c),
+    })
+}
+
+/// The C= key (left Alt) plus a PC key on the PET: what Shift does on the
+/// PET key showing the same character (that key's code + $80), so Alt is
+/// the PET's Shift for every key. With Shift too, the character the PC
+/// key shows shifted (US layout); letters are the same either way.
+pub fn pet_graphic(c: char, shift: bool) -> Option<u8> {
+    if c.is_ascii_alphabetic() {
+        return Some(c.to_ascii_uppercase() as u8 | 0x80);
+    }
+    let c = if shift {
+        match c {
+            '1' => '!',
+            '2' => '@',
+            '3' => '#',
+            '4' => '$',
+            '5' => '%',
+            '6' => '^',
+            '7' => '&',
+            '8' => '*',
+            '9' => '(',
+            '0' => ')',
+            '=' => '+',
+            ';' => ':',
+            '\'' => '"',
+            ',' => '<',
+            '.' => '>',
+            '/' => '?',
+            _ => return None,
+        }
+    } else {
+        c
+    };
+    let key = match c {
+        '`' => 0x5F,
+        '^' => 0x5E,
+        ' '..='@' | '[' | '\\' | ']' => c as u8,
+        _ => return None,
+    };
+    Some(key | 0x80)
+}
+
+/// CTRL plus a key (its unshifted character) on `model`.
+pub fn control_code(model: &Model, c: char) -> Option<u8> {
+    if model.keys != Keys::C64 && !matches!(c, '0'..='9' | '`') {
+        return None;
+    }
     Some(match c {
         'a'..='z' => c as u8 - b'a' + 1,
         '1'..='9' => CONTROL_DIGITS[usize::from(c as u8 - b'1')],
@@ -71,9 +140,13 @@ pub fn control_code(c: char) -> Option<u8> {
     })
 }
 
-/// C= plus a key: its unshifted character, or with Shift the C64 key
-/// the PC key shows (Shift+2 is @, Shift+8 is *, Shift+= is +).
-pub fn commodore_code(c: char, shift: bool) -> Option<u8> {
+/// C= plus a key on `model`: its unshifted character, or with Shift the
+/// C64 key the PC key shows (Shift+2 is @, Shift+8 is *, Shift+= is +).
+pub fn commodore_code(model: &Model, c: char, shift: bool) -> Option<u8> {
+    // Without the eight extra colours, C=+1-8 type the shifted digit.
+    if model.colour_codes < 16 && !shift && ('1'..='8').contains(&c) {
+        return Some(c as u8 - 0x10);
+    }
     let c = match (c, shift) {
         ('2', true) => '@',
         ('8', true) => '*',
@@ -118,8 +191,8 @@ pub fn control_key_code(key: Key, shift: bool) -> Option<u8> {
 }
 
 impl CbmKeyboard {
-    pub fn new() -> Self {
-        Self
+    pub fn new(model: &'static Model) -> Self {
+        Self { model }
     }
 
     /// Translate one key press into an editing action.
@@ -130,13 +203,26 @@ impl CbmKeyboard {
             Some(code) => EditAction::Insert(code),
             None => EditAction::None,
         };
+        if self.model.keys == Keys::PetGraphics {
+            match key {
+                Key::Tab if mods.control && mods.shift => return EditAction::SetTabStop,
+                Key::Tab if mods.control => return EditAction::NextTabStop,
+                Key::Tab if mods.shift => return insert(Some(crate::petscii::RVS_OFF)),
+                Key::Tab => return insert(Some(crate::petscii::RVS_ON)),
+                Key::Char(c) => return insert(pet_printable(c)),
+                Key::Commodore(c) => return insert(pet_graphic(c, mods.shift)),
+                // No CTRL key, no colours, no function keys.
+                Key::Control(_) | Key::Function(_) => return EditAction::None,
+                _ => {}
+            }
+        }
         if mods.control && !matches!(key, Key::Control(_)) {
             return insert(control_key_code(key, mods.shift));
         }
         match key {
             Key::Char(c) => insert(printable(c)),
-            Key::Control(c) => insert(control_code(c)),
-            Key::Commodore(c) => insert(commodore_code(c, mods.shift)),
+            Key::Control(c) => insert(control_code(self.model, c)),
+            Key::Commodore(c) => insert(commodore_code(self.model, c, mods.shift)),
             Key::Function(_) | Key::Escape => EditAction::None,
             Key::Up => EditAction::MoveUp,
             Key::Down => EditAction::MoveDown,
@@ -176,11 +262,11 @@ mod tests {
     use retro_core::Mods;
 
     fn press(k: Key) -> EditAction {
-        CbmKeyboard::new().handle(KeyInput::plain(k))
+        CbmKeyboard::new(&crate::model::C64).handle(KeyInput::plain(k))
     }
 
     fn with(k: Key, control: bool, commodore: bool, shift: bool) -> EditAction {
-        CbmKeyboard::new().handle(KeyInput {
+        CbmKeyboard::new(&crate::model::C64).handle(KeyInput {
             key: k,
             mods: Mods {
                 shift,
@@ -267,6 +353,95 @@ mod tests {
         assert_eq!(cbm('2', true), EditAction::Insert(0xA4)); // C=+ @
         assert_eq!(cbm('8', true), EditAction::Insert(0xDF)); // C=+ *
         assert_eq!(cbm('9', false), EditAction::None);
+    }
+
+    #[test]
+    fn the_vic20_keyboard() {
+        let vic = |k, control, commodore| {
+            CbmKeyboard::new(&crate::model::VIC20).handle(KeyInput {
+                key: k,
+                mods: Mods {
+                    shift: false,
+                    control,
+                    commodore,
+                },
+            })
+        };
+        // CTRL: colours and RVS as on the C64; letters type nothing.
+        assert_eq!(vic(Control('1'), true, false), EditAction::Insert(0x90));
+        assert_eq!(vic(Control('9'), true, false), EditAction::Insert(0x12));
+        assert_eq!(vic(Control('`'), true, false), EditAction::Insert(0x06));
+        assert_eq!(vic(Control('n'), true, false), EditAction::None);
+        assert_eq!(vic(Control('\\'), true, false), EditAction::None);
+        // C=+1-8: the shifted digit; C=+letters: graphics as on the C64.
+        assert_eq!(vic(Commodore('1'), false, true), EditAction::Insert(b'!'));
+        assert_eq!(vic(Commodore('8'), false, true), EditAction::Insert(b'('));
+        assert_eq!(vic(Commodore('a'), false, true), EditAction::Insert(0xB0));
+    }
+
+    #[test]
+    fn the_pet_graphics_keyboard() {
+        let pet = |k, control, commodore, shift| {
+            CbmKeyboard::new(&crate::model::PET).handle(KeyInput {
+                key: k,
+                mods: Mods {
+                    shift,
+                    control,
+                    commodore,
+                },
+            })
+        };
+        assert_eq!(
+            pet(Char('a'), false, false, false),
+            EditAction::Insert(0x41)
+        );
+        assert_eq!(
+            pet(Char('A'), false, false, false),
+            EditAction::Insert(0xC1)
+        );
+        assert_eq!(
+            pet(Char('\\'), false, false, false),
+            EditAction::Insert(0x5C)
+        );
+        assert_eq!(
+            pet(Char('{'), false, false, false),
+            EditAction::Insert(0xDB)
+        );
+        // Alt (C=) + key: the graphic on that PET key.
+        assert_eq!(
+            pet(Commodore('1'), false, true, false),
+            EditAction::Insert(0xB1)
+        );
+        assert_eq!(
+            pet(Commodore('1'), false, true, true),
+            EditAction::Insert(0xA1)
+        );
+        assert_eq!(
+            pet(Commodore('2'), false, true, true),
+            EditAction::Insert(0xC0)
+        );
+        assert_eq!(
+            pet(Commodore(' '), false, true, false),
+            EditAction::Insert(0xA0)
+        );
+        // Letters too: Alt is the PET's Shift for every key.
+        assert_eq!(
+            pet(Commodore('a'), false, true, false),
+            EditAction::Insert(0xC1)
+        );
+        assert_eq!(
+            pet(Commodore('z'), false, true, true),
+            EditAction::Insert(0xDA)
+        );
+        // Tab is RVS; CTRL+Tab the next tab stop.
+        assert_eq!(pet(Tab, false, false, false), EditAction::Insert(0x12));
+        assert_eq!(pet(Tab, false, false, true), EditAction::Insert(0x92));
+        assert_eq!(pet(Tab, true, false, false), EditAction::NextTabStop);
+        // No CTRL letters or colours, no function keys; CTRL+cursor still
+        // inserts the code.
+        assert_eq!(pet(Control('1'), true, false, false), EditAction::None);
+        assert_eq!(pet(Function(1), true, false, false), EditAction::None);
+        assert_eq!(pet(Down, true, false, false), EditAction::Insert(0x11));
     }
 
     #[test]

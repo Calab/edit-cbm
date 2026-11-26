@@ -18,12 +18,15 @@ pub fn placeholder() -> Vec<u8> {
 }
 
 /// The glyphs of character set `charset` (0 = Graphics, 1 = Mixed case)
-/// from a font file: a whole C64 character ROM (4096 bytes, both sets),
+/// from a font file. With `reversed` (a C64 or VIC-20 ROM, each set
+/// followed by its reversed copy): a whole ROM (4096 bytes, both sets),
 /// one set from it (2048 bytes, normal then reversed), or just its normal
-/// characters (1024 bytes).
-pub fn set_from_rom(file: &[u8], charset: usize) -> Result<Vec<u8>, String> {
+/// characters (1024 bytes). Without (a PET ROM): both sets (2048 bytes),
+/// or one (1024).
+pub fn set_from_rom(file: &[u8], charset: usize, reversed: bool) -> Result<Vec<u8>, String> {
     let start = match file.len() {
         4096 => charset.min(1) * 2048,
+        2048 if !reversed => charset.min(1) * 1024,
         2048 | 1024 => 0,
         n => {
             return Err(format!(
@@ -54,11 +57,16 @@ mod tests {
     fn reads_rom_sizes() {
         let mut rom = vec![0u8; 4096];
         rom[2048] = 0xAA;
-        assert_eq!(set_from_rom(&rom, 0).unwrap()[0], 0);
-        assert_eq!(set_from_rom(&rom, 1).unwrap()[0], 0xAA);
-        assert_eq!(set_from_rom(&rom[2048..], 0).unwrap()[0], 0xAA);
-        assert_eq!(set_from_rom(&rom[..1024], 1).unwrap().len(), SET_SIZE);
-        assert!(set_from_rom(&rom[..1000], 0).is_err());
+        assert_eq!(set_from_rom(&rom, 0, true).unwrap()[0], 0);
+        assert_eq!(set_from_rom(&rom, 1, true).unwrap()[0], 0xAA);
+        assert_eq!(set_from_rom(&rom[2048..], 0, true).unwrap()[0], 0xAA);
+        assert_eq!(set_from_rom(&rom[..1024], 1, true).unwrap().len(), SET_SIZE);
+        assert!(set_from_rom(&rom[..1000], 0, true).is_err());
+        // A PET ROM: two plain sets of 1024.
+        let mut pet = vec![0u8; 2048];
+        pet[1024] = 0x55;
+        assert_eq!(set_from_rom(&pet, 1, false).unwrap()[0], 0x55);
+        assert_eq!(set_from_rom(&pet, 0, false).unwrap()[0], 0);
     }
 
     #[test]

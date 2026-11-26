@@ -230,6 +230,13 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
     let clipboard = video.clipboard();
     let mut events = sdl.event_pump()?;
 
+    // Test hooks for screenshots. First, switch to the nth system (System menu order).
+    if let Some(n) = std::env::var("RETRO_EDITOR_SYSTEM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        app.switch_system(n);
+    }
     // Test hooks for screenshots: open a menu, select some lines.
     if let Some(m) = std::env::var("RETRO_EDITOR_MENU")
         .ok()
@@ -419,13 +426,6 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
         let frame = app.frame(canvas.output_size()?);
         app.text_input(&text, sdl2::keyboard::Mod::NOMOD, &frame.layout);
         app.test_save();
-    }
-    // Switch to the nth system (System menu order).
-    if let Some(n) = std::env::var("RETRO_EDITOR_SYSTEM")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        app.switch_system(n);
     }
     // Press dialog buttons in turn, e.g. "0,0".
     if let Ok(list) = std::env::var("RETRO_EDITOR_CHOOSE") {

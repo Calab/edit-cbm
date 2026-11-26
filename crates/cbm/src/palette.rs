@@ -49,6 +49,9 @@ pub const VIC20: [Colour; 16] = [
     ("Light yellow", (0xFF, 0xFF, 0xC9)),
 ];
 
+/// The PET's screen: green phosphor on black (VICE's `green.vpl`).
+pub const PET: [Colour; 2] = [("Black", (0x00, 0x00, 0x00)), ("Green", (0x41, 0xFF, 0x00))];
+
 fn rgb(table: &[Colour], colour: u8) -> (u8, u8, u8) {
     table[usize::from(colour).min(table.len() - 1)].1
 }
@@ -73,6 +76,14 @@ pub fn vic20_rgb(colour: u8, _lum: u8) -> (u8, u8, u8) {
 
 pub fn vic20_label(colour: u8, _lum: u8) -> String {
     label(&VIC20, colour)
+}
+
+pub fn pet_rgb(colour: u8, _lum: u8) -> (u8, u8, u8) {
+    rgb(&PET, colour)
+}
+
+pub fn pet_label(colour: u8, _lum: u8) -> String {
+    label(&PET, colour)
 }
 
 #[cfg(test)]

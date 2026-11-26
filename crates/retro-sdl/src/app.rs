@@ -132,8 +132,10 @@ pub enum Overlay {
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    /// Pixels per character cell.
+    /// Pixels per character cell: its height, and its width (half the
+    /// height on an 80-column screen, whose characters are narrower).
     pub cell: u32,
+    pub cell_w: u32,
     /// Top of the text area (bottom of the menu bar).
     pub text_top: i32,
     /// Top of the status bar.
@@ -383,11 +385,20 @@ impl App {
     /// machine has a colour model.
     pub fn color_choice(&self) -> Option<[(u8, u8); 3]> {
         let m = self.sys.colors?;
-        let fix = |(h, l): (u8, u8)| (h.min(m.hues - 1), l.min(m.lums - 1));
+        let fix = |(h, l): (u8, u8), hues: u8| (h.min(hues - 1), l.min(m.lums - 1));
         Some([
-            fix(self.config.text_color.unwrap_or(m.default_text)),
-            fix(self.config.background_color.unwrap_or(m.default_background)),
-            fix(self.config.border_color.unwrap_or(m.default_border)),
+            fix(
+                self.config.text_color.unwrap_or(m.default_text),
+                m.text_hues,
+            ),
+            fix(
+                self.config.background_color.unwrap_or(m.default_background),
+                m.hues,
+            ),
+            fix(
+                self.config.border_color.unwrap_or(m.default_border),
+                m.border_hues,
+            ),
         ])
     }
 
@@ -442,7 +453,16 @@ impl App {
 
     /// Lay out the window: menu bar, text area, status bar.
     pub fn frame(&self, (width, height): (u32, u32)) -> Frame {
-        let cell = self.config.scale * 8;
+        // An 80-column screen draws all 8 columns of each character in
+        // half the width, which needs at least zoom 2.
+        let narrow = self.sys.machine.narrow_pixels();
+        let scale = if narrow {
+            self.config.scale.max(2)
+        } else {
+            self.config.scale
+        };
+        let cell = scale * 8;
+        let cell_w = if narrow { cell / 2 } else { cell };
         let text_top = self.bar_height;
         let status_top = height as i32 - self.bar_height;
         let rows = ((status_top - text_top).max(0) as u32 / cell) as usize;
@@ -451,7 +471,7 @@ impl App {
         } else {
             0
         };
-        let cols = (width.saturating_sub(gutter_w) / cell) as usize;
+        let cols = (width.saturating_sub(gutter_w) / cell_w) as usize;
         let mut layout = self.editor.layout(self.sys.machine.as_ref(), cols, rows);
         if !self.config.show_codes {
             layout.hide = Some(retro_core::HideRule::for_machine(self.sys.machine.as_ref()));
@@ -460,7 +480,7 @@ impl App {
         // together; if they don't fit, the right border goes first.
         let gutter_x = match self.editor.wrap {
             WrapMode::Native => {
-                let w = gutter_w + (layout.left_margin + layout.text_cols) as u32 * cell;
+                let w = gutter_w + (layout.left_margin + layout.text_cols) as u32 * cell_w;
                 (width.saturating_sub(w) / 2) as i32
             }
             WrapMode::Window => 0,
@@ -470,6 +490,7 @@ impl App {
             width,
             height,
             cell,
+            cell_w,
             text_top,
             status_top,
             layout,
@@ -2796,11 +2817,12 @@ impl App {
             _ => 2,
         };
         let (mut h, mut l) = colors[which];
+        let hues = [m.text_hues, m.hues, m.border_hues][which];
         if matches!(f, Field::FgHue | Field::BgHue | Field::BrdHue) {
             h = if up {
-                (h + 1) % m.hues
+                (h + 1) % hues
             } else {
-                (h + m.hues - 1) % m.hues
+                (h + hues - 1) % hues
             };
         } else {
             l = if up {
@@ -3649,7 +3671,7 @@ impl App {
     /// Document position under pixel (x, y), clamped into the text area.
     fn pos_at(&self, x: i32, y: i32, f: &Frame) -> Pos {
         let cell = f.cell as i32;
-        let col = (x - f.origin_x).div_euclid(cell) - f.layout.left_margin as i32;
+        let col = (x - f.origin_x).div_euclid(f.cell_w as i32) - f.layout.left_margin as i32;
         let row = (y - f.text_top).div_euclid(cell);
         let abs = (self.editor.top as i32 + row).max(0) as usize;
         f.layout

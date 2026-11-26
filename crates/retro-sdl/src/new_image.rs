@@ -492,6 +492,7 @@ impl NewImagePopup {
                 canvas,
                 atlas,
                 cell: cell as u32,
+                cell_w: cell as u32,
                 origin_x: x,
                 origin_y: y,
             };
