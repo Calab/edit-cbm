@@ -35,8 +35,11 @@ pub enum Purpose {
     /// Choose a format to read the current file in; the buttons are the
     /// formats' names, then Cancel.
     ReopenAs,
-    /// Some lines would be saved as ERROR- lines: Save Anyway / Cancel.
-    SaveProblemLines,
+    /// The format warns about something before saving (lines it can't
+    /// store as they are, say): Save Anyway / Cancel.
+    SaveWarning,
+    /// A program has bytes after it (machine code?): Keep / Strip Off.
+    Trailer,
     /// Choose the format to save in; the buttons are the formats' names,
     /// then Cancel.
     SaveAsFormat,
@@ -171,14 +174,33 @@ impl Dialog {
 
     /// Buttons: 0 = Save Anyway, 1 = Cancel.
     /// `lines` are (line number, index in the editor).
-    pub fn save_problem_lines(format: &str, lines: &[(u32, usize)]) -> Self {
+    /// Buttons: 0 = Save Anyway, 1 = Cancel.
+    pub fn save_warning(format: &str, warning: &str) -> Self {
         Self {
-            purpose: Purpose::SaveProblemLines,
-            title: "Syntax errors".into(),
-            text: problem_lines_text(format, lines),
+            purpose: Purpose::SaveWarning,
+            title: format!("Saving as {format}"),
+            text: warning.into(),
             buttons: vec!["Save Anyway", "Cancel"],
             focus: 1,
             cancel: 1,
+            button_rects: Vec::new(),
+        }
+    }
+
+    /// Buttons: 0 = Keep, 1 = Strip Off.
+    pub fn trailer(file_name: &str, bytes: usize) -> Self {
+        Self {
+            purpose: Purpose::Trailer,
+            title: "DATA found after program".into(),
+            text: format!(
+                "{file_name} has {bytes} bytes after the BASIC program: \
+                 machine code, perhaps, started by a SYS line.\n\n\
+                 They're kept, and saved after the program again. Or strip \
+                 them off, to keep only the BASIC program."
+            ),
+            buttons: vec!["Keep", "Strip Off"],
+            focus: 0,
+            cancel: 0,
             button_rects: Vec::new(),
         }
     }
@@ -291,7 +313,9 @@ impl Dialog {
         canvas.set_blend_mode(BlendMode::NONE);
 
         let lh = font.line_height();
-        let lines: Vec<&str> = self.text.lines().collect();
+        // Long lines wrap, so a dialog is never wider than this.
+        let max_w = (lh * 26).min(width as i32 - pad * 16).max(lh * 8);
+        let lines = wrap(font, &self.text, max_w);
         let button_w: Vec<i32> = self
             .buttons
             .iter()
@@ -367,37 +391,31 @@ impl Dialog {
     }
 }
 
-/// The Syntax errors dialog's text: each line by its number and where it
-/// is in the editor (the first eight, then how many more).
-fn problem_lines_text(format: &str, lines: &[(u32, usize)]) -> String {
-    const SHOWN: usize = 8;
-    let mut s = if lines.len() == 1 {
-        "1 line has a syntax error:\n".to_string()
-    } else {
-        format!("{} lines have syntax errors:\n", lines.len())
-    };
-    for (number, index) in lines.iter().take(SHOWN) {
-        s += &format!("\n    Line {number} (editor line {})", index + 1);
+/// `text`'s lines, each wrapped at spaces to fit `max_w` pixels; a
+/// wrapped line's continuation keeps its indent.
+fn wrap(font: &mut UiFont, text: &str, max_w: i32) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if font.measure_marked(line) <= max_w {
+            out.push(line.to_string());
+            continue;
+        }
+        let indent: String = line.chars().take_while(|&c| c == ' ').collect();
+        let mut cur = String::new();
+        for word in line.split_whitespace() {
+            let candidate = if cur.is_empty() {
+                format!("{indent}{word}")
+            } else {
+                format!("{cur} {word}")
+            };
+            if !cur.is_empty() && font.measure_marked(&candidate) > max_w {
+                out.push(std::mem::take(&mut cur));
+                cur = format!("{indent}{word}");
+            } else {
+                cur = candidate;
+            }
+        }
+        out.push(cur);
     }
-    if lines.len() > SHOWN {
-        s += &format!("\n    ...and {} more.", lines.len() - SHOWN);
-    }
-    s += &format!("\n\nThey will be saved as ERROR- lines, as {format} would.");
-    s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn problem_lines_show_both_numbers() {
-        let t = problem_lines_text("Atari BASIC", &[(10, 2), (30, 0)]);
-        assert!(t.starts_with("2 lines have syntax errors:\n"), "{t}");
-        assert!(t.contains("Line 10 (editor line 3)"), "{t}");
-        assert!(t.contains("Line 30 (editor line 1)"), "{t}");
-        assert!(t.ends_with("as Atari BASIC would."), "{t}");
-        let many: Vec<(u32, usize)> = (0..10).map(|i| (i * 10, i as usize)).collect();
-        assert!(problem_lines_text("X", &many).contains("...and 2 more."));
-    }
+    out
 }

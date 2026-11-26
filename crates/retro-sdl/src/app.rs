@@ -611,10 +611,21 @@ impl App {
     fn open_source_as(&mut self, source: Source, forced: Option<&'static dyn FileFormat>) {
         match self.read_source(&source) {
             Ok(bytes) => {
+                let ext = source.extension();
+                let mut fmt = forced.unwrap_or_else(|| {
+                    format::detect(self.sys.machine.formats(), &bytes, ext.as_deref())
+                });
+                // A program that belongs to another system (by its load
+                // address, say) switches the window to it.
+                if forced.is_none()
+                    && let Some(id) = fmt.system_for(&bytes, self.sys.id)
+                    && id != self.sys.id
+                    && self.switch_to_id(id)
+                {
+                    fmt = format::detect(self.sys.machine.formats(), &bytes, ext.as_deref());
+                }
                 let formats = self.sys.machine.formats();
                 let text = self.sys.machine.text_format();
-                let ext = source.extension();
-                let fmt = forced.unwrap_or_else(|| format::detect(formats, &bytes, ext.as_deref()));
                 let d = match fmt.decode(&bytes) {
                     Ok(d) => d,
                     Err(e) => {
@@ -622,7 +633,8 @@ impl App {
                         return;
                     }
                 };
-                let doc = Document::from_lines(d.lines, d.final_eol);
+                let mut doc = Document::from_lines(d.lines, d.final_eol);
+                doc.meta = d.meta;
                 self.message = None;
                 // Only for a file read as plain text: a tokenized program
                 // has no $9B line ends and may well hold CR or LF bytes.
@@ -653,6 +665,12 @@ impl App {
                 self.new_editor(doc);
                 if matches!(source, Source::Image { .. }) {
                     self.image_copy = Some(bytes);
+                }
+                // Machine code (perhaps) after a program: say so, and offer
+                // to strip it off.
+                let trailer = self.editor.doc.meta.trailer.len();
+                if trailer > 0 {
+                    self.dialog = Some(Dialog::trailer(&source.name(), trailer));
                 }
             }
             // A file named on the command line that isn't there yet.
@@ -1142,11 +1160,10 @@ impl App {
             self.pending_save = Some(save);
             return;
         }
-        if !encoded.problem_lines.is_empty() && !save.confirmed {
-            self.dialog = Some(Dialog::save_problem_lines(
-                save.format.name(),
-                &encoded.problem_lines,
-            ));
+        if let Some(warning) = &encoded.warning
+            && !save.confirmed
+        {
+            self.dialog = Some(Dialog::save_warning(save.format.name(), warning));
             self.pending_save = Some(save);
             return;
         }
@@ -1196,13 +1213,8 @@ impl App {
             Source::File(_) => String::new(),
         };
         self.source = Some(save.target);
-        let errors = match encoded.problem_lines.len() {
-            0 => String::new(),
-            1 => ", 1 line as ERROR-".into(),
-            n => format!(", {n} lines as ERROR-"),
-        };
         self.message = Some(format!(
-            "Saved {} bytes{to} ({}{errors})",
+            "Saved {} bytes{to} ({})",
             encoded.bytes.len(),
             save.format.name()
         ));
@@ -1251,7 +1263,17 @@ impl App {
                 1 => self.perform(after),
                 _ => {}
             },
-            Purpose::SaveProblemLines => {
+            Purpose::Trailer => {
+                if button == 1 {
+                    let n = self.editor.doc.meta.trailer.len();
+                    self.editor.doc.meta.trailer.clear();
+                    self.editor.doc.mark_modified();
+                    self.message = Some(format!(
+                        "{n} bytes after the program stripped off (not saved yet)"
+                    ));
+                }
+            }
+            Purpose::SaveWarning => {
                 if let Some(mut save) = self.pending_save.take()
                     && button == 0
                 {
@@ -1650,6 +1672,18 @@ impl App {
         self.set_charset(next);
         let m = &self.sys.machine;
         self.message = Some(format!("{} character set", m.charsets()[m.charset()]));
+    }
+
+    /// Show the system with id `id` in this window. Returns false if
+    /// there's no such system.
+    fn switch_to_id(&mut self, id: &str) -> bool {
+        match self.system_list.iter().position(|&(i, _)| i == id) {
+            Some(n) => {
+                self.switch_system(n);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Show the `i`th system (in menu order) in this window. The document

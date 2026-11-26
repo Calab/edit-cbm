@@ -16,6 +16,8 @@ pub struct Document {
     pub final_eol: bool,
     /// Overwrite (true) or insert (false) typing mode.
     pub overwrite: bool,
+    /// What the file holds besides its lines (load address, ...).
+    pub meta: crate::FileMeta,
     /// Identifies the current contents; every edit gets a new number, so
     /// undoing back to the saved contents makes the document unmodified.
     version: u64,
@@ -59,6 +61,7 @@ impl Document {
             cursor: Pos::default(),
             final_eol,
             overwrite: false,
+            meta: crate::FileMeta::default(),
             version: 0,
             saved_version: 0,
             last_version: 0,

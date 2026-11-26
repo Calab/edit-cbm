@@ -53,6 +53,7 @@ pub fn decode(bytes: &[u8]) -> Decoded {
             lines: vec![Vec::new()],
             final_eol: false,
             converted_from: None,
+            meta: Default::default(),
         };
     }
     let final_eol = bytes.last() == Some(&CR);
@@ -66,6 +67,7 @@ pub fn decode(bytes: &[u8]) -> Decoded {
         lines,
         final_eol,
         converted_from: None,
+        meta: Default::default(),
     }
 }
 

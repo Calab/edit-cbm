@@ -5,7 +5,7 @@
 use retro_core::{CodeEffect, Decoded, FileFormat, Machine};
 
 use crate::model::Model;
-use crate::{FORMATS, font, petscii};
+use crate::{font, petscii};
 
 /// Index of the Mixed case set in [`Machine::charsets`].
 pub const MIXED_CASE: usize = 1;
@@ -258,11 +258,12 @@ impl Machine for Cbm {
             lines,
             final_eol: true,
             converted_from: Some("PC text".into()),
+            meta: Default::default(),
         }
     }
 
     fn formats(&self) -> &'static [&'static dyn FileFormat] {
-        FORMATS
+        self.model.formats
     }
 }
 

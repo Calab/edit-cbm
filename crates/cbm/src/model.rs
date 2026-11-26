@@ -1,5 +1,7 @@
 //! What differs between the Commodore models the editor shows.
 
+use retro_core::FileFormat;
+
 use crate::palette;
 
 /// Which keyboard a model has (see [`crate::keyboard`]).
@@ -36,6 +38,8 @@ pub struct Model {
     pub rom_reversed: bool,
     /// No colour choice: the screen is always `text` on `background`.
     pub fixed_colours: bool,
+    /// The file formats it reads and writes.
+    pub formats: &'static [&'static dyn FileFormat],
     /// The development character ROM's name in `fonts-dev`.
     pub rom_file: &'static str,
     /// The colours, and functions for the colour picker.
@@ -69,6 +73,7 @@ pub static C64: Model = Model {
     narrow: false,
     rom_reversed: true,
     fixed_colours: false,
+    formats: crate::C64_FORMATS,
     rom_file: "c64-chargen.bin",
     colours: &palette::C64,
     rgb: palette::c64_rgb,
@@ -93,6 +98,7 @@ pub static VIC20: Model = Model {
     narrow: false,
     rom_reversed: true,
     fixed_colours: false,
+    formats: crate::VIC20_FORMATS,
     rom_file: "vic20-chargen.bin",
     colours: &palette::VIC20,
     rgb: palette::vic20_rgb,
@@ -119,6 +125,7 @@ const PET_40: Model = Model {
     narrow: false,
     rom_reversed: false,
     fixed_colours: true,
+    formats: crate::PET_FORMATS,
     rom_file: "pet-chargen.bin",
     colours: &palette::PET,
     rgb: palette::pet_rgb,

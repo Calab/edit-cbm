@@ -3,6 +3,20 @@
 use crate::format::FileFormat;
 use crate::tabs::TabStops;
 
+/// What a file holds besides its lines, kept with the document and
+/// written back when it's saved in the same format.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileMeta {
+    /// Where a program loads in memory (a Commodore PRG file's first two
+    /// bytes), if the file has one.
+    pub load_address: Option<u16>,
+    /// Bytes after the program (machine code, say), written back after it.
+    pub trailer: Vec<u8>,
+    /// The program's length in the file it was read from (without the
+    /// load address and trailer), to tell whether the trailer moves.
+    pub program_len: usize,
+}
+
 /// Result of decoding a file from disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decoded {
@@ -13,6 +27,8 @@ pub struct Decoded {
     /// Set when the file was converted from PC text (File > Import). The
     /// string is a short human-readable description for the status bar.
     pub converted_from: Option<String>,
+    /// Anything else the file holds.
+    pub meta: FileMeta,
 }
 
 /// An offer, after Import, to put a listing's lower case in capitals.
@@ -205,6 +221,7 @@ pub trait Machine {
             lines,
             final_eol: true,
             converted_from: Some("PC text".into()),
+            meta: FileMeta::default(),
         }
     }
 

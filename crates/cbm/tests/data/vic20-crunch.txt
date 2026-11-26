@@ -1,0 +1,3 @@
+10 print"aAb";:a=1:score=2
+20 data to,"x:y",to:print
+30 ?a:pR1

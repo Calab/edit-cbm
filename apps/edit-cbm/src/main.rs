@@ -15,18 +15,43 @@ use retro_sdl::{
 };
 
 /// The Open and Save dialogs' file types, one per language.
-const OPEN_FILTERS: &[(&str, &[&str])] = &[("PETSCII text", &["SEQ"]), ("Text", &["TXT"])];
+const OPEN_FILTERS: &[(&str, &[&str])] = &[
+    ("BASIC programs", &["PRG"]),
+    ("PETSCII text", &["SEQ"]),
+    ("Text", &["TXT"]),
+];
 
 /// Help > File Types: the extensions for each language.
 const FILE_TYPES: &[&str] = &[
     "FILE TYPES",
     "",
+    ".PRG  BASIC programs, tokenized as the machine",
+    "      SAVEs them: BASIC 2.0 (C64, VIC-20, PET)",
+    "      and BASIC 4.0 (PET)",
     ".SEQ  PETSCII text: a carriage return ($0D)",
     "      ends each line",
     ".TXT  The same",
     "",
-    "Opening reads any file as PETSCII text, byte for",
-    "byte. Tokenized BASIC programs (.PRG) come later.",
+    "Opening reads a program as LIST shows it, and",
+    "switches the window to the machine it's for: a",
+    "program loading at $0801 is the C64's, $1001 or",
+    "$1201 the VIC-20's, $0401 the PET's (or the",
+    "VIC-20's with 3K more, if the window shows the",
+    "VIC-20). BASIC 4.0's disk commands mean a PET.",
+    "Anything else opens as PETSCII text.",
+    "",
+    "Saving a program stores each line exactly as",
+    "typing it in on the machine would: keywords",
+    "become tokens outside quotes, REM and DATA; ? is",
+    "PRINT; abbreviations work (g+Shift+O is GOTO);",
+    "lines are sorted by number, and a number alone",
+    "deletes its line. Save warns first about lines",
+    "it can't store (no line number) and characters",
+    "BASIC drops (graphics outside quotes).",
+    "",
+    "Bytes after a program (machine code started by",
+    "SYS) are kept and saved after it again; opening",
+    "offers to strip them off.",
     "",
     "EXPORT AND IMPORT",
     "",

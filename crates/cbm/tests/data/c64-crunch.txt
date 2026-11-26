@@ -1,0 +1,8 @@
+10 print"aAb";:a=1:score=2
+20 data to,"x:y",to:print
+30 rem to "x" print
+40 ?a:pR1
+50 aA=1
+60 for i=1to10step2:next
+70 if a>=1then 10
+80 go to 10:goto10

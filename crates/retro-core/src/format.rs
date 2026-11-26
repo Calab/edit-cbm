@@ -58,6 +58,13 @@ pub trait FileFormat: Sync {
     /// Read a file into lines of machine codes.
     fn decode(&self, bytes: &[u8]) -> Result<Decoded, String>;
 
+    /// The system (its id) a file in this format belongs to, if the file
+    /// says (a Commodore program's load address does). `current` is the
+    /// id of the system the window shows.
+    fn system_for(&self, _bytes: &[u8], _current: &str) -> Option<&'static str> {
+        None
+    }
+
     /// Whether [`FileFormat::encode`] is available.
     fn can_encode(&self) -> bool {
         false
@@ -73,19 +80,18 @@ pub trait FileFormat: Sync {
 #[derive(Debug)]
 pub struct Encoded {
     pub bytes: Vec<u8>,
-    /// Lines that couldn't be written properly and were stored another
-    /// way (a BASIC line with a syntax error is stored as an ERROR- line),
-    /// as (line number, index in the editor). The editor asks before
-    /// saving these.
-    pub problem_lines: Vec<(u32, usize)>,
+    /// Something the user should know before the file is written (lines
+    /// that can't be stored as they are, say): the editor shows it and
+    /// asks Save Anyway / Cancel.
+    pub warning: Option<String>,
 }
 
 impl Encoded {
-    /// Bytes with no problem lines.
+    /// Bytes with nothing to warn about.
     pub fn clean(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
-            problem_lines: Vec::new(),
+            warning: None,
         }
     }
 }
