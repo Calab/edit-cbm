@@ -1,0 +1,9 @@
+[package]
+name = "cbm"
+description = "Commodore support for Edit CBM: PETSCII, character sets, systems"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+retro-core = { path = "../retro-core" }

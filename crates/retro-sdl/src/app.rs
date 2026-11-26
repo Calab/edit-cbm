@@ -1,0 +1,3909 @@
+//! Editor state, input handling and commands.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use retro_core::attrs;
+use retro_core::{
+    Document, EditAction, Editor, FileFormat, Key, KeyInput, Layout, Mods, Pos, WrapMode,
+    clipboard, format,
+};
+use sdl2::clipboard::ClipboardUtil;
+use sdl2::keyboard::{Keycode, Mod};
+
+use crate::AppSpec;
+use crate::render::rgb;
+use sdl2::pixels::Color;
+
+/// The colours of the machine's screen for one frame.
+pub struct ScreenColors {
+    pub text: Color,
+    pub background: Color,
+    pub border: Color,
+    pub warning: Color,
+    pub selection: Color,
+    pub selection_text: Color,
+}
+use crate::dialog::{After, Dialog, Purpose};
+
+/// `name` with extension `ext`, in lower case if the old extension had
+/// lower-case letters (`prog.bas` -> `prog.lst`), else in capitals.
+fn with_extension_like(name: &str, ext: &str) -> String {
+    let path = Path::new(name);
+    let old = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let ext = if old.chars().any(|c| c.is_ascii_lowercase()) {
+        ext.to_ascii_lowercase()
+    } else {
+        ext.to_ascii_uppercase()
+    };
+    path.with_extension(ext).to_string_lossy().into_owned()
+}
+use std::sync::mpsc;
+
+/// A file dialog running on another thread.
+struct FileJob {
+    kind: FileJobKind,
+    rx: mpsc::Receiver<Option<PathBuf>>,
+}
+
+/// A save in progress: where, in what format, and what to do after.
+struct PendingSave {
+    target: Source,
+    /// A file already in the image may be replaced (Save writes back to
+    /// where the document came from; Save to Image asks first).
+    replace: bool,
+    format: &'static dyn FileFormat,
+    then: Option<After>,
+    /// The user agreed to save lines as ERROR- lines.
+    confirmed: bool,
+    /// The user agreed to save over a file another program changed.
+    overwrite: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileJobKind {
+    Open,
+    /// Import a PC text file.
+    Import,
+    /// Choose the default folder (Preferences).
+    Folder,
+    /// Save As, then optionally carry on with something.
+    SaveAs {
+        then: Option<After>,
+    },
+    /// Save Listing As: always plain text.
+    SaveListingAs,
+    /// Export as PC text, Unicode or ASCII with tags.
+    Export(ExportKind),
+    /// Save the printout as a PDF.
+    SavePdf,
+    /// Choose a font file for character set `n`.
+    Font(usize),
+    /// Choose a disk image (Open from Image).
+    ChooseImage,
+    /// Where to save a new, blank disk image.
+    NewImage,
+}
+
+/// The forms File > Export writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    /// UTF-8 for the machine's font (Private Use characters).
+    MachineFont,
+    /// UTF-8 with standard symbols, for any font.
+    Standard,
+    /// Plain ASCII with tags.
+    Ascii,
+}
+
+impl ExportKind {
+    fn label(self) -> &'static str {
+        match self {
+            ExportKind::MachineFont => "Unicode",
+            ExportKind::Standard => "standard Unicode",
+            ExportKind::Ascii => "ASCII",
+        }
+    }
+}
+use crate::config::{self, Config, ControlKey, DirMode};
+use crate::find_page::{self, FindPage};
+use crate::fonts_page::{self, FontsPage};
+use crate::image_page::{self, ImagePage};
+use crate::local_time;
+use crate::menu::{self, Command, Geometry, ItemState, Menu, MenuState};
+use crate::new_image::NewImagePopup;
+use crate::prefs::{self, Field, Op, Prefs};
+use crate::print_page::{self, PrintPage};
+use crate::source::Source;
+use retro_core::disk::{DiskError, DiskErrorKind, DiskVolume};
+use retro_core::print::{Paper, PrintSettings};
+use retro_core::search;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    None,
+    Help,
+    FileTypes,
+    Licensing,
+}
+
+/// Pixel layout of the window for one frame.
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    /// Pixels per character cell.
+    pub cell: u32,
+    /// Top of the text area (bottom of the menu bar).
+    pub text_top: i32,
+    /// Top of the status bar.
+    pub status_top: i32,
+    pub layout: Layout,
+    /// X pixel of character column 0.
+    pub origin_x: i32,
+    /// The line-number column: its left edge and width (0 when off).
+    pub gutter_x: i32,
+    pub gutter_w: u32,
+}
+
+/// What commands need from the window system.
+pub struct Ctx<'a> {
+    pub clipboard: &'a ClipboardUtil,
+    pub frame: &'a Frame,
+}
+
+pub struct App {
+    pub spec: AppSpec,
+    pub config: Config,
+    pub editor: Editor,
+    /// Where the document came from, and where Save writes it.
+    pub source: Option<Source>,
+    /// The name an imported document, not yet saved, goes by: the PC
+    /// file's name with the text format's extension.
+    import_name: Option<String>,
+    /// A file dropped on the window (or chosen from the recent files),
+    /// waiting for "Save changes?".
+    dropped: Option<Source>,
+    /// The settings as loaded, so only this window's changes are saved
+    /// (other windows may have saved theirs meanwhile).
+    config_initial: Config,
+    /// Files this window opened or saved, most recent first, for the
+    /// recent files list.
+    opened: Vec<String>,
+    /// The Options menu's character set item, for rebuilding the menus.
+    alt_charset: Option<&'static str>,
+    /// The file's modification time and size when last read or written,
+    /// to notice another program changing it. For a file in a disk image,
+    /// the image file's.
+    disk_stamp: Option<(std::time::SystemTime, u64)>,
+    /// For a file in a disk image: its bytes as last read or written, so
+    /// a change to other files in the image doesn't count as a change
+    /// to this one.
+    image_copy: Option<Vec<u8>>,
+    /// The Find / Go to Line panel, when open, and what it holds.
+    pub find: Option<FindPage>,
+    /// The Find and Replace fields: one-line Atari text, and how far each
+    /// is scrolled sideways.
+    pub find_field: Editor,
+    pub replace_field: Editor,
+    pub field_scroll: [usize; 2],
+    match_case: bool,
+    match_inverse: bool,
+    line_text: String,
+    /// Lines in capitals, waiting for an answer in the Import dialog.
+    pending_case: Option<Vec<Vec<u8>>>,
+    /// The format the document was read in (see `retro_core::format`).
+    pub format: &'static dyn FileFormat,
+    /// A save waiting for an answer in a dialog.
+    pending_save: Option<PendingSave>,
+    pub message: Option<String>,
+    pub running: bool,
+    pub overlay: Overlay,
+    pub overlay_top: usize,
+    /// The Preferences page, when open.
+    pub prefs: Option<Prefs>,
+    /// The Print page, when open.
+    pub print: Option<PrintPage>,
+    /// The Fonts page, when open.
+    pub fonts: Option<FontsPage>,
+    /// The Open from Image page, when open.
+    pub image_page: Option<ImagePage>,
+    /// A new, blank image waiting for the Save dialog to say where it
+    /// goes.
+    new_image_bytes: Option<Vec<u8>>,
+    pub menus: Vec<Menu>,
+    pub context_menu: Menu,
+    pub menu: MenuState,
+    /// Where the menus were last drawn.
+    pub geom: Geometry,
+    /// Physical pixels per logical pixel (HiDPI).
+    pub ratio: f32,
+    /// Interface spacing unit and bar height, in pixels.
+    pub pad: i32,
+    /// Spacing on the Preferences page, which uses a smaller font.
+    pub prefs_pad: i32,
+    pub bar_height: i32,
+    /// How far a digit of the line-number font advances, per pixel of
+    /// its size.
+    pub gutter_advance: f32,
+    /// The dialog box being shown, if any.
+    pub dialog: Option<Dialog>,
+    /// A file dialog waiting for an answer.
+    file_job: Option<FileJob>,
+    /// The last key press was a command, so the text it would type (e.g.
+    /// the `` ` `` of the inverse key) must be ignored.
+    swallow_text: bool,
+    /// Selecting text by dragging with the mouse.
+    dragging: bool,
+    /// The character set changed, so the glyph texture must be rebuilt.
+    pub charset_changed: bool,
+    /// When the flashing cursor last started its "on" half: at each key
+    /// press, typed text or click (not mouse movement).
+    flash_start: Instant,
+}
+
+impl App {
+    pub fn new(mut spec: AppSpec) -> Self {
+        let config = Config::load(spec.app_id);
+        let charset = config.charset.min(spec.machine.charsets().len() - 1);
+        spec.machine.set_charset(charset);
+        spec.keyboard.set_charset(charset);
+        // The Options menu toggles the second character set, if any.
+        let alt_charset = spec
+            .machine
+            .charsets()
+            .get(1)
+            .map(|name| &*Box::leak(format!("&{name} Character Set").into_boxed_str()));
+        let format = spec.machine.text_format();
+        let editor = Editor::new(
+            Document::new(),
+            config.wrap,
+            spec.machine.default_tab_stops(),
+        );
+        let menus = menu::menus(alt_charset, &config.recent, spec.disks.is_some());
+        let config_initial = config.clone();
+        let field = Editor::new(
+            Document::new(),
+            WrapMode::Window,
+            spec.machine.default_tab_stops(),
+        );
+        Self {
+            spec,
+            config,
+            editor,
+            source: None,
+            import_name: None,
+            pending_case: None,
+            dropped: None,
+            config_initial,
+            opened: Vec::new(),
+            alt_charset,
+            disk_stamp: None,
+            image_copy: None,
+            find: None,
+            find_field: field.clone(),
+            replace_field: field,
+            field_scroll: [0, 0],
+            match_case: false,
+            match_inverse: false,
+            line_text: String::new(),
+            format,
+            pending_save: None,
+            message: None,
+            running: true,
+            overlay: Overlay::None,
+            overlay_top: 0,
+            prefs: None,
+            print: None,
+            fonts: None,
+            image_page: None,
+            new_image_bytes: None,
+            menus,
+            context_menu: menu::context_menu(),
+            menu: MenuState::default(),
+            geom: Geometry::default(),
+            ratio: 1.0,
+            pad: 6,
+            prefs_pad: 5,
+            bar_height: 24,
+            gutter_advance: 0.6,
+            dialog: None,
+            file_job: None,
+            swallow_text: false,
+            dragging: false,
+            charset_changed: false,
+            flash_start: Instant::now(),
+        }
+    }
+
+    // ----- colours -------------------------------------------------------------
+
+    /// The selection as Copy takes it. With codes hidden, it starts with
+    /// the colour and reverse codes in force where it starts, so it pastes
+    /// looking as it did.
+    pub fn copy_text(&self) -> Option<Vec<Vec<u8>>> {
+        let (a, _) = self.editor.selection()?;
+        let mut text = self.editor.copy()?;
+        if !self.config.show_codes && self.config.act_on_codes {
+            let m = self.spec.machine.as_ref();
+            let look = attrs::state_at(m, self.editor.doc.lines(), a);
+            let codes = attrs::codes_between(m, attrs::Attr::default(), look, None);
+            text[0].splice(0..0, codes);
+        }
+        Some(text)
+    }
+
+    /// Text about to be pasted, with codes added at its end where needed
+    /// so the text after it keeps its colour and reverse.
+    fn keep_look_after(&self, mut text: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        if !self.config.act_on_codes || text.is_empty() {
+            return text;
+        }
+        let m = self.spec.machine.as_ref();
+        let lines = self.editor.doc.lines();
+        let cur = self.editor.doc.cursor();
+        let (a, b) = self.editor.selection().unwrap_or((cur, cur));
+        let (before, after) = (attrs::state_at(m, lines, a), attrs::state_at(m, lines, b));
+        let end = attrs::state_after(m, &text, before);
+        let screen = self.color_choice().map(|[t, ..]| t.0);
+        let codes = attrs::codes_between(m, end, after, screen);
+        text.last_mut().unwrap().extend(codes);
+        text
+    }
+
+    /// The text, background and border colours as (hue, lum), if the
+    /// machine has a colour model.
+    pub fn color_choice(&self) -> Option<[(u8, u8); 3]> {
+        let m = self.spec.colors?;
+        let fix = |(h, l): (u8, u8)| (h.min(m.hues - 1), l.min(m.lums - 1));
+        Some([
+            fix(self.config.text_color.unwrap_or(m.default_text)),
+            fix(self.config.background_color.unwrap_or(m.default_background)),
+            fix(self.config.border_color.unwrap_or(m.default_border)),
+        ])
+    }
+
+    pub fn screen_colors(&self) -> ScreenColors {
+        let pal = self.spec.palette;
+        let mut c = ScreenColors {
+            text: rgb(pal.foreground),
+            background: rgb(pal.background),
+            border: rgb(pal.border),
+            warning: rgb(pal.warning),
+            selection: rgb(pal.selection),
+            selection_text: rgb(pal.selection_text),
+        };
+        if let (Some(m), Some([text, back, border])) = (self.spec.colors, self.color_choice()) {
+            let look = |(h, l): (u8, u8)| rgb((m.rgb)(h, l));
+            c.text = look(text);
+            c.background = look(back);
+            c.border = look(border);
+        }
+        c
+    }
+
+    /// A key press, typed text or click: show the flashing cursor now and
+    /// start its flashing over.
+    pub fn restart_flash(&mut self) {
+        self.flash_start = Instant::now();
+    }
+
+    /// How long the event loop may sleep before the flashing cursor needs
+    /// it.
+    pub fn next_wakeup(&self) -> Option<Duration> {
+        let now = Instant::now();
+        // The cursor always flashes, as on every Commodore machine.
+        let ms = now.duration_since(self.flash_start).as_millis() as u64;
+        Some(Duration::from_millis(
+            CURSOR_FLASH_MS - ms % CURSOR_FLASH_MS,
+        ))
+    }
+
+    /// Whether the cursor shows now: in the first half of each flash.
+    /// Each key press or click starts it on.
+    pub fn cursor_visible(&self) -> bool {
+        (self.flash_start.elapsed().as_millis() as u64 / CURSOR_FLASH_MS).is_multiple_of(2)
+    }
+
+    pub fn set_ui_metrics(&mut self, line_height: i32) {
+        self.pad = (6.0 * self.ratio).round() as i32;
+        self.prefs_pad = (5.0 * self.ratio).round() as i32;
+        self.bar_height = line_height + self.pad;
+    }
+
+    /// Lay out the window: menu bar, text area, status bar.
+    pub fn frame(&self, (width, height): (u32, u32)) -> Frame {
+        let cell = self.config.scale * 8;
+        let text_top = self.bar_height;
+        let status_top = height as i32 - self.bar_height;
+        let rows = ((status_top - text_top).max(0) as u32 / cell) as usize;
+        let gutter_w = if self.config.line_numbers {
+            Self::gutter_width(self.gutter_advance, cell)
+        } else {
+            0
+        };
+        let cols = (width.saturating_sub(gutter_w) / cell) as usize;
+        let mut layout = self.editor.layout(self.spec.machine.as_ref(), cols, rows);
+        if !self.config.show_codes {
+            layout.hide = Some(retro_core::HideRule::for_machine(
+                self.spec.machine.as_ref(),
+            ));
+        }
+        // In 40 columns, the line numbers and the screen are centred
+        // together; if they don't fit, the right border goes first.
+        let gutter_x = match self.editor.wrap {
+            WrapMode::Native => {
+                let w = gutter_w + (layout.left_margin + layout.text_cols) as u32 * cell;
+                (width.saturating_sub(w) / 2) as i32
+            }
+            WrapMode::Window => 0,
+        };
+        let origin_x = gutter_x + gutter_w as i32;
+        Frame {
+            width,
+            height,
+            cell,
+            text_top,
+            status_top,
+            layout,
+            origin_x,
+            gutter_x,
+            gutter_w,
+        }
+    }
+
+    /// The line-number font's size for character cells `cell` pixels high.
+    pub fn gutter_font_px(cell: u32) -> f32 {
+        cell as f32 * 0.85
+    }
+
+    /// Width of the line-number column for `cell`-pixel characters: five
+    /// digits (each `advance` per pixel of font size), a little space
+    /// before them and a character's width after.
+    pub fn gutter_width(advance: f32, cell: u32) -> u32 {
+        let digits = 5.0 * advance * Self::gutter_font_px(cell);
+        (cell as f32 * 0.5 + digits).ceil() as u32 + cell
+    }
+
+    /// The document's name: the file's (in an image, the name on the
+    /// disk), the imported file's, or "Untitled".
+    pub fn file_name(&self) -> String {
+        self.source
+            .as_ref()
+            .map(Source::name)
+            .or_else(|| self.import_name.clone())
+            .unwrap_or_else(|| "Untitled".into())
+    }
+
+    /// The name with its image if it's in one: "MYDISK.ATR > SAMPLE.LST".
+    pub fn source_label(&self) -> String {
+        match &self.source {
+            Some(s) => s.label(),
+            None => self.file_name(),
+        }
+    }
+
+    pub fn window_title(&self) -> String {
+        format!(
+            "{}{} - {}",
+            self.source_label(),
+            if self.editor.doc.is_modified() {
+                "*"
+            } else {
+                ""
+            },
+            self.spec.title
+        )
+    }
+
+    fn new_editor(&mut self, doc: Document) {
+        self.editor = Editor::new(doc, self.config.wrap, self.editor.tabs.clone());
+        self.import_name = None;
+        self.disk_stamp = None;
+        self.image_copy = None;
+    }
+
+    // ----- files -------------------------------------------------------------
+
+    pub fn open_path(&mut self, path: &Path) {
+        self.open_source(Source::File(path.to_path_buf()));
+    }
+
+    fn open_source(&mut self, source: Source) {
+        self.open_source_as(source, None);
+    }
+
+    /// Read a document's bytes from where it is: the file, or the file in
+    /// its disk image. Errors are io errors, or the disk's own text.
+    fn read_source(&self, source: &Source) -> Result<Vec<u8>, SourceError> {
+        match source {
+            Source::File(p) => std::fs::read(p).map_err(SourceError::Io),
+            Source::Image { image, path } => {
+                let vol = self.open_image(image)?;
+                vol.read(path).map_err(SourceError::Disk)
+            }
+        }
+    }
+
+    /// Read and open a disk image file.
+    fn open_image(&self, image: &Path) -> Result<Box<dyn DiskVolume>, SourceError> {
+        let Some(disks) = &self.spec.disks else {
+            return Err(SourceError::Disk(DiskError::other(
+                "this editor can't read disk images",
+            )));
+        };
+        let bytes = std::fs::read(image).map_err(SourceError::Io)?;
+        disks.open(&bytes).map_err(SourceError::Disk)
+    }
+
+    /// Write `bytes` to `source`. For a file in an image: read the image
+    /// afresh, write the file into it (replacing one already there only
+    /// if `replace`), then save the whole image. On any error nothing is
+    /// changed.
+    fn write_source(
+        &self,
+        source: &Source,
+        bytes: &[u8],
+        replace: bool,
+    ) -> Result<(), SourceError> {
+        match source {
+            Source::File(p) => write_atomically(p, bytes).map_err(SourceError::Io),
+            Source::Image { image, path } => {
+                let mut vol = self.open_image(image)?;
+                // Dated now, on disks that keep dates.
+                vol.write(path, bytes, replace, local_time::now())
+                    .map_err(SourceError::Disk)?;
+                write_atomically(image, &vol.to_bytes()).map_err(SourceError::Io)
+            }
+        }
+    }
+
+    /// Open a document, in `forced` format if given, otherwise the format
+    /// `format::detect` picks.
+    fn open_source_as(&mut self, source: Source, forced: Option<&'static dyn FileFormat>) {
+        match self.read_source(&source) {
+            Ok(bytes) => {
+                let formats = self.spec.machine.formats();
+                let text = self.spec.machine.text_format();
+                let ext = source.extension();
+                let fmt = forced.unwrap_or_else(|| format::detect(formats, &bytes, ext.as_deref()));
+                let d = match fmt.decode(&bytes) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.message = Some(format!("Can't read {}: {e}", fmt.name()));
+                        return;
+                    }
+                };
+                let doc = Document::from_lines(d.lines, d.final_eol);
+                self.message = None;
+                // Only for a file read as plain text: a tokenized program
+                // has no $9B line ends and may well hold CR or LF bytes.
+                if forced.is_none()
+                    && format::same(fmt, text)
+                    && self.spec.machine.looks_like_pc_text(&bytes)
+                {
+                    self.message = Some("PC text? Use File > Import".into());
+                }
+                if !fmt.can_encode() {
+                    self.message = Some(format!(
+                        "{} listing; Save writes a .{} file",
+                        fmt.name(),
+                        text.extension()
+                    ));
+                }
+                // A file another format would have read, but for damage.
+                if forced.is_none()
+                    && format::same(fmt, text)
+                    && let Some(f) = formats
+                        .iter()
+                        .find(|f| !format::same(**f, text) && f.looks_like(&bytes))
+                {
+                    let why = f.decode(&bytes).err().unwrap_or_default();
+                    self.message = Some(format!("Damaged {} file: {why}", f.name()));
+                }
+                self.format = fmt;
+                self.new_editor(doc);
+                if matches!(source, Source::Image { .. }) {
+                    self.image_copy = Some(bytes);
+                }
+            }
+            // A file named on the command line that isn't there yet.
+            Err(SourceError::Io(e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && matches!(source, Source::File(_)) =>
+            {
+                self.format = self.spec.machine.text_format();
+                self.new_editor(Document::new());
+                self.message = Some("New file".into());
+            }
+            Err(e) => {
+                self.message = Some(format!("Can't open {}: {e}", describe(&source)));
+                return;
+            }
+        }
+        self.disk_stamp = Self::stamp(source.host());
+        if self.disk_stamp.is_some() {
+            self.note_recent(&source);
+        }
+        self.source = Some(source);
+    }
+
+    /// Import a PC text file as a new, unsaved document in the text
+    /// format. Saving asks for a name, so the PC file is never overwritten
+    /// by accident.
+    fn import_path(&mut self, path: &Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.message = Some(format!("Can't import {}: {e}", path.display()));
+                return;
+            }
+        };
+        let d = self.spec.machine.import_text(&bytes);
+        let offer = self.spec.machine.case_offer(&d.lines);
+        let mut doc = Document::from_lines(d.lines, d.final_eol);
+        doc.mark_modified();
+        let text = self.spec.machine.text_format();
+        self.format = text;
+        self.new_editor(doc);
+        self.source = None;
+        self.import_name = path
+            .file_name()
+            .map(|n| with_extension_like(&n.to_string_lossy(), text.extension()));
+        self.note_folder(path);
+        self.message = Some(format!(
+            "Imported {}",
+            d.converted_from.unwrap_or_else(|| "PC text".into())
+        ));
+        if let Some(offer) = offer {
+            self.dialog = Some(Dialog::import_case(&self.file_name(), &offer));
+            self.pending_case = Some(offer.lines);
+        }
+    }
+
+    /// Replace the imported text with its capitals (Import dialog).
+    fn convert_case(&mut self) {
+        let Some(lines) = self.pending_case.take() else {
+            return;
+        };
+        let name = self.import_name.take();
+        let mut doc = Document::from_lines(lines, self.editor.doc.final_eol);
+        doc.mark_modified();
+        self.new_editor(doc);
+        self.import_name = name;
+        self.message = Some("Imported; converted to capitals".into());
+    }
+
+    fn file_dialog(&self, title: &str, for_save: bool) -> rfd::FileDialog {
+        // Each extension in both cases: file names on Atari disks are in
+        // capitals, on a PC often not.
+        let both = |exts: &[&str]| -> Vec<String> {
+            exts.iter()
+                .flat_map(|e| [e.to_ascii_uppercase(), e.to_ascii_lowercase()])
+                .collect()
+        };
+        // The macOS Open panel has no file-type menu: it would only allow
+        // the listed extensions, hiding files with none (often the case
+        // for Atari Logo files). Show every file there instead.
+        if !for_save && cfg!(target_os = "macos") {
+            let d = rfd::FileDialog::new().set_title(title);
+            return self.in_start_dir(d, for_save);
+        }
+        let all: Vec<&str> = self
+            .spec
+            .file_types
+            .iter()
+            .flat_map(|(_, exts)| exts.iter().copied())
+            .collect();
+        let mut d = rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter(format!("{} files", self.spec.machine.name()), &both(&all));
+        for (name, exts) in self.spec.file_types {
+            let shown: Vec<String> = exts.iter().map(|e| format!(".{e}")).collect();
+            d = d.add_filter(format!("{name} ({})", shown.join(", ")), &both(exts));
+        }
+        let d = d.add_filter("All files", &["*"]);
+        self.in_start_dir(d, for_save)
+    }
+
+    /// Start a dialog in the folder it should open in: beside the current
+    /// file when saving, otherwise the default folder from Preferences.
+    fn in_start_dir(&self, mut d: rfd::FileDialog, for_save: bool) -> rfd::FileDialog {
+        let beside = self
+            .source
+            .as_ref()
+            .and_then(|s| s.host().parent())
+            .filter(|d| for_save && d.is_dir())
+            .map(Path::to_path_buf);
+        if let Some(dir) = beside.or_else(|| self.config.start_dir()) {
+            d = d.set_directory(dir);
+        }
+        d
+    }
+
+    /// Remember the folder of a file just opened or saved.
+    fn note_folder(&mut self, path: &Path) {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            self.config.last_dir = dir.to_string_lossy().into_owned();
+        }
+    }
+
+    /// Show an Open or Save As dialog. It runs on its own thread so the
+    /// window keeps responding; [`App::poll_file_job`] picks up the answer.
+    /// (macOS needs dialogs on the main thread, and stays responsive there.)
+    fn start_file_job(&mut self, kind: FileJobKind) {
+        let d = match kind {
+            FileJobKind::SaveAs { .. } => self
+                .file_dialog("Save As", true)
+                .set_file_name(self.save_name()),
+            FileJobKind::SaveListingAs => self
+                .file_dialog("Save Listing As", true)
+                .set_file_name(self.listing_name()),
+            FileJobKind::Export { .. } => {
+                let d = rfd::FileDialog::new()
+                    .set_title("Export")
+                    .add_filter("Text files (.txt)", &["txt", "TXT"])
+                    .add_filter("All files", &["*"])
+                    .set_file_name(self.export_name());
+                self.in_start_dir(d, true)
+            }
+            FileJobKind::Open => self.file_dialog("Open", false),
+            FileJobKind::ChooseImage => self.image_dialog(),
+            FileJobKind::NewImage => self.new_image_dialog(),
+            FileJobKind::Font(i) => {
+                let mut d = rfd::FileDialog::new()
+                    .set_title("Font")
+                    .add_filter("Atari fonts (.fnt)", &["fnt", "FNT"])
+                    .add_filter("All files", &["*"]);
+                // Start beside the font in use, if it's a file; else in
+                // the fonts that come with the program.
+                let current = Path::new(&self.config.fonts[i])
+                    .parent()
+                    .filter(|d| d.is_dir())
+                    .map(Path::to_path_buf);
+                // Failing that, the home folder.
+                let dir = current
+                    .or_else(|| bundled_fonts(self.spec.app_id))
+                    .or_else(home_dir);
+                if let Some(dir) = dir {
+                    d = d.set_directory(dir);
+                }
+                d
+            }
+            FileJobKind::SavePdf => {
+                let d = rfd::FileDialog::new()
+                    .set_title("Save as PDF")
+                    .add_filter("PDF files (.pdf)", &["pdf", "PDF"])
+                    .add_filter("All files", &["*"])
+                    .set_file_name(with_extension_like(&self.file_name(), "PDF"));
+                self.in_start_dir(d, true)
+            }
+            FileJobKind::Import => {
+                let d = rfd::FileDialog::new().set_title("Import");
+                // Every file on macOS (see `file_dialog`).
+                let d = if cfg!(target_os = "macos") {
+                    d
+                } else {
+                    d.add_filter("Text files (.txt)", &["txt", "TXT"])
+                        .add_filter("All files", &["*"])
+                };
+                self.in_start_dir(d, false)
+            }
+            FileJobKind::Folder => {
+                let mut d = rfd::FileDialog::new().set_title("Default Folder");
+                if let Some(dir) = self.config.start_dir() {
+                    d = d.set_directory(dir);
+                }
+                d
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        let run = move || {
+            let _ = tx.send(match kind {
+                FileJobKind::SaveAs { .. }
+                | FileJobKind::SaveListingAs
+                | FileJobKind::Export { .. }
+                | FileJobKind::SavePdf
+                | FileJobKind::NewImage => d.save_file(),
+                FileJobKind::Open
+                | FileJobKind::Import
+                | FileJobKind::Font(_)
+                | FileJobKind::ChooseImage => d.pick_file(),
+                FileJobKind::Folder => d.pick_folder(),
+            });
+        };
+        if cfg!(target_os = "macos") {
+            run();
+        } else {
+            std::thread::spawn(run);
+        }
+        self.file_job = Some(FileJob { kind, rx });
+        self.message = Some("Waiting for the file dialog...".into());
+    }
+
+    pub fn file_job_pending(&self) -> bool {
+        self.file_job.is_some()
+    }
+
+    /// Act on the file dialog's answer once it arrives.
+    pub fn poll_file_job(&mut self) {
+        let Some(job) = &self.file_job else { return };
+        let result = match job.rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        let kind = job.kind;
+        self.file_job = None;
+        self.message = None;
+        match (kind, result) {
+            (FileJobKind::Open, Some(path)) => {
+                self.note_folder(&path);
+                self.open_path(&path);
+            }
+            (FileJobKind::Import, Some(path)) => self.import_path(&path),
+            (FileJobKind::ChooseImage, Some(path)) => {
+                self.note_folder(&path);
+                self.load_image_page(path);
+            }
+            (FileJobKind::NewImage, Some(path)) => self.write_new_image(path),
+            // Not saved: the New Image pop-up stays, to try again.
+            (FileJobKind::NewImage, None) => self.new_image_bytes = None,
+            // Nothing chosen, and no image to show: there's no page.
+            (FileJobKind::ChooseImage, None) => {
+                if self.image_page.as_ref().is_some_and(|p| p.image.is_none()) {
+                    self.image_page = None;
+                }
+            }
+            (FileJobKind::SavePdf, Some(path)) => self.save_pdf(&path),
+            (FileJobKind::Font(i), Some(path)) => {
+                self.set_font(i, Some(&path));
+                self.fonts = Some(FontsPage::new(self.font_sets()));
+                if let Some(p) = &mut self.fonts {
+                    p.focus_on(fonts_page::Field::Browse(i));
+                }
+            }
+            (FileJobKind::Folder, Some(dir)) => {
+                self.config.default_dir = dir.to_string_lossy().into_owned();
+                self.config.dir_mode = DirMode::Fixed;
+            }
+            (FileJobKind::SaveAs { then }, Some(path)) => self.save_as_to(path, then),
+            (FileJobKind::SaveListingAs, Some(path)) => self.save_to(PendingSave {
+                target: Source::File(path),
+                replace: true,
+                format: self.spec.machine.text_format(),
+                then: None,
+                confirmed: false,
+                overwrite: false,
+            }),
+            (FileJobKind::Export(kind), Some(path)) => self.export_to(&path, kind),
+            (_, None) => {} // cancelled
+        }
+    }
+
+    /// The name Export suggests: the current name with `.txt`.
+    fn export_name(&self) -> String {
+        with_extension_like(&self.file_name(), "TXT")
+    }
+
+    /// The document as PC text with this platform's line endings, and how
+    /// many characters had no exact equivalent.
+    fn export_text(&self, kind: ExportKind) -> (String, usize) {
+        let machine = &self.spec.machine;
+        let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+        let doc = &self.editor.doc;
+        let lines = doc.lines();
+        let mut text = String::new();
+        let mut lost = 0;
+        for (i, line) in lines.iter().enumerate() {
+            text += &match kind {
+                ExportKind::MachineFont => machine.export_unicode(line),
+                ExportKind::Ascii => machine.export_ascii(line),
+                ExportKind::Standard => {
+                    let (s, n) = machine.export_standard(line);
+                    lost += n;
+                    s
+                }
+            };
+            if i + 1 < lines.len() || doc.final_eol {
+                text += newline;
+            }
+        }
+        (text, lost)
+    }
+
+    /// Export was chosen in the dialog: warn first if characters would be
+    /// lost, then ask for the file name.
+    fn export_chosen(&mut self, kind: ExportKind) {
+        let (_, lost) = self.export_text(kind);
+        if lost > 0 {
+            self.dialog = Some(Dialog::export_lossy(kind, lost));
+        } else {
+            self.start_file_job(FileJobKind::Export(kind));
+        }
+    }
+
+    /// Write the document as PC text. The document keeps its own file and
+    /// format.
+    fn export_to(&mut self, path: &Path, kind: ExportKind) {
+        let (text, lost) = self.export_text(kind);
+        match write_atomically(path, text.as_bytes()) {
+            Ok(()) => {
+                self.note_folder(path);
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let lost = match lost {
+                    0 => String::new(),
+                    1 => ", 1 character not exact".into(),
+                    n => format!(", {n} characters not exact"),
+                };
+                self.message = Some(format!(
+                    "Exported {name} ({}, {} bytes{lost})",
+                    kind.label(),
+                    text.len()
+                ));
+            }
+            Err(e) => self.message = Some(format!("Export failed: {e}")),
+        }
+    }
+
+    /// The name Save As suggests: the current name, with the text format's
+    /// extension if the document's own format can't be written.
+    fn save_name(&self) -> String {
+        if self.format.can_encode() {
+            self.file_name()
+        } else {
+            self.listing_name()
+        }
+    }
+
+    /// The current name with the text format's extension: PROG.BAS ->
+    /// PROG.LST, prog.bas -> prog.lst.
+    fn listing_name(&self) -> String {
+        with_extension_like(
+            &self.file_name(),
+            self.spec.machine.text_format().extension(),
+        )
+    }
+
+    /// Save to the current file (asking for a name if there isn't one, or
+    /// if its format can't be written), then do `then` if the save worked.
+    fn save(&mut self, then: Option<After>) {
+        match self.source.clone() {
+            Some(target) if self.format.can_encode() => self.save_to(PendingSave {
+                target,
+                replace: true,
+                format: self.format,
+                then,
+                confirmed: false,
+                overwrite: false,
+            }),
+            _ => self.start_file_job(FileJobKind::SaveAs { then }),
+        }
+    }
+
+    /// Save As chose `path`: pick the format from its extension.
+    ///
+    /// * The text format's extensions (`.LST`, `.TXT`, `.ASM`...): text.
+    /// * Formats that use the extension, as their own or shared (`.TUR`,
+    ///   or `.BAS` for every BASIC): the document's format if it's one of
+    ///   them and can be written; else the format whose own extension it
+    ///   is; else ask which, if any can be written; otherwise say they
+    ///   can't be written yet.
+    /// * Anything else: the document's format if it can be written, else
+    ///   text.
+    fn save_as_to(&mut self, path: PathBuf, then: Option<After>) {
+        self.save_as_target(Source::File(path), then);
+    }
+
+    /// Save As (or Save to Image) chose `target`: the format by the rules
+    /// of [`App::save_as_to`]. A file already in a disk image is replaced
+    /// only after asking (the OS dialog has asked about other files).
+    fn save_as_target(&mut self, target: Source, then: Option<After>) {
+        let text = self.spec.machine.text_format();
+        let ext = target.extension().unwrap_or_default().to_ascii_uppercase();
+        let replace = matches!(target, Source::File(_));
+        let uses = |f: &&'static dyn FileFormat| {
+            f.extension() == ext
+                || f.extensions()
+                    .iter()
+                    .chain(f.shared_extensions())
+                    .any(|x| x.eq_ignore_ascii_case(&ext))
+        };
+        let pending = |format| PendingSave {
+            target: target.clone(),
+            replace,
+            format,
+            then,
+            confirmed: false,
+            overwrite: false,
+        };
+        if uses(&text) {
+            return self.save_to(pending(text));
+        }
+        let users: Vec<&'static dyn FileFormat> = self
+            .spec
+            .machine
+            .formats()
+            .iter()
+            .copied()
+            .filter(|f| !format::same(*f, text))
+            .filter(uses)
+            .collect();
+        let writable: Vec<_> = users.iter().copied().filter(|f| f.can_encode()).collect();
+        // A format's own extension (.TUR) means that format; a shared one
+        // (.BAS) leaves the choice to the user.
+        let own: Vec<_> = writable
+            .iter()
+            .copied()
+            .filter(|f| f.extensions().iter().any(|x| x.eq_ignore_ascii_case(&ext)))
+            .collect();
+        if writable.iter().any(|f| format::same(*f, self.format)) {
+            self.save_to(pending(self.format));
+        } else if let [f] = own[..] {
+            self.save_to(pending(f));
+        } else if !writable.is_empty() {
+            let mut names: Vec<&'static str> = writable.iter().map(|f| f.name()).collect();
+            names.push(text.name());
+            self.dialog = Some(Dialog::save_as_format(&target.name(), names));
+            self.pending_save = Some(pending(text));
+        } else if let Some(f) = users.first() {
+            self.message = Some(format!(
+                "{} files can't be written yet; save as .{} instead",
+                f.name(),
+                text.extension()
+            ));
+        } else if self.format.can_encode() {
+            self.save_to(pending(self.format));
+        } else {
+            self.save_to(pending(text));
+        }
+    }
+
+    /// Write a pending save, first asking if lines would be saved as
+    /// ERROR- lines. On success the file becomes the document's.
+    fn save_to(&mut self, save: PendingSave) {
+        let encoded = match save.format.encode(&self.editor.doc) {
+            Ok(e) => e,
+            Err(e) => {
+                // The format can't hold the program as it is: say why, in
+                // a dialog rather than the easily missed status bar.
+                let name = save.target.name();
+                self.dialog = Some(Dialog::notice(
+                    &format!("Can't save {name}"),
+                    &format!(
+                        "{name} wasn't saved as {}.\n\n{}",
+                        save.format.name(),
+                        sentence(&e)
+                    ),
+                ));
+                self.message = Some("Not saved".into());
+                return;
+            }
+        };
+        // Another program changed the file (or the disk image it's in)
+        // since it was read here.
+        if !save.overwrite
+            && self.source.as_ref().map(Source::host) == Some(save.target.host())
+            && self.changed_on_disk()
+        {
+            let changed = match &save.target {
+                Source::File(_) => self.file_name(),
+                Source::Image { .. } => file_label(&save.target.host().to_string_lossy()),
+            };
+            self.dialog = Some(Dialog::overwrite_changed(&changed));
+            self.pending_save = Some(save);
+            return;
+        }
+        if !encoded.problem_lines.is_empty() && !save.confirmed {
+            self.dialog = Some(Dialog::save_problem_lines(
+                save.format.name(),
+                &encoded.problem_lines,
+            ));
+            self.pending_save = Some(save);
+            return;
+        }
+        match self.write_source(&save.target, &encoded.bytes, save.replace) {
+            Ok(()) => {}
+            Err(SourceError::Io(e)) => {
+                self.message = Some(format!("Save failed: {e}"));
+                return;
+            }
+            // Already in the image: ask first.
+            Err(SourceError::Disk(e))
+                if e.kind == DiskErrorKind::AlreadyExists && !save.replace =>
+            {
+                let image = file_label(&save.target.host().to_string_lossy());
+                self.dialog = Some(Dialog::replace_in_image(&save.target.name(), &image));
+                self.pending_save = Some(save);
+                return;
+            }
+            // Disk full, locked, write-protected...: worth a dialog.
+            Err(SourceError::Disk(e)) => {
+                let label = save.target.label();
+                self.dialog = Some(Dialog::notice(
+                    &format!("Can't save {}", save.target.name()),
+                    &format!("{label} wasn't saved.\n\n{}", sentence(&e.message)),
+                ));
+                self.message = Some("Not saved".into());
+                return;
+            }
+        }
+        self.format = save.format;
+        self.editor.doc.mark_saved();
+        self.note_folder(save.target.host());
+        self.disk_stamp = Self::stamp(save.target.host());
+        self.note_recent(&save.target);
+        // Saved into an image from Save to Image: the page's job is done.
+        if matches!(save.target, Source::Image { .. }) {
+            self.image_page = None;
+        }
+        self.image_copy = match save.target {
+            Source::Image { .. } => Some(encoded.bytes.clone()),
+            Source::File(_) => None,
+        };
+        let to = match &save.target {
+            Source::Image { image, .. } => {
+                format!(" to {}", file_label(&image.to_string_lossy()))
+            }
+            Source::File(_) => String::new(),
+        };
+        self.source = Some(save.target);
+        let errors = match encoded.problem_lines.len() {
+            0 => String::new(),
+            1 => ", 1 line as ERROR-".into(),
+            n => format!(", {n} lines as ERROR-"),
+        };
+        self.message = Some(format!(
+            "Saved {} bytes{to} ({}{errors})",
+            encoded.bytes.len(),
+            save.format.name()
+        ));
+        if let Some(after) = save.then {
+            self.perform(after);
+        }
+    }
+
+    /// Do `after`, first asking to save unsaved changes.
+    fn guard(&mut self, after: After) {
+        if self.editor.doc.is_modified() {
+            self.dialog = Some(Dialog::save_changes(&self.file_name(), after));
+        } else {
+            self.perform(after);
+        }
+    }
+
+    fn perform(&mut self, after: After) {
+        match after {
+            After::New => {
+                self.format = self.spec.machine.text_format();
+                self.new_editor(Document::new());
+                self.source = None;
+                self.message = None;
+            }
+            After::Open => self.start_file_job(FileJobKind::Open),
+            After::OpenFromImage => self.open_image_page(image_page::Mode::Open),
+            After::Import => self.start_file_job(FileJobKind::Import),
+            After::OpenDropped => {
+                if let Some(source) = self.dropped.take() {
+                    self.note_folder(source.host());
+                    self.open_source(source);
+                }
+            }
+            After::Quit => self.running = false,
+        }
+    }
+
+    /// A dialog button was chosen.
+    fn dialog_choose(&mut self, button: usize) {
+        let Some(d) = self.dialog.take() else { return };
+        match d.purpose {
+            Purpose::About | Purpose::Notice => {}
+            Purpose::SaveChanges(after) => match button {
+                0 => self.save(Some(after)),
+                1 => self.perform(after),
+                _ => {}
+            },
+            Purpose::SaveProblemLines => {
+                if let Some(mut save) = self.pending_save.take()
+                    && button == 0
+                {
+                    save.confirmed = true;
+                    self.save_to(save);
+                }
+            }
+            Purpose::SaveAsFormat => {
+                let name = d.buttons.get(button).copied();
+                let chosen = self
+                    .spec
+                    .machine
+                    .formats()
+                    .iter()
+                    .copied()
+                    .find(|f| Some(f.name()) == name);
+                if let (Some(f), Some(mut save)) = (chosen, self.pending_save.take()) {
+                    save.format = f;
+                    self.save_to(save);
+                }
+            }
+            Purpose::Export => match button {
+                0 => self.export_chosen(ExportKind::MachineFont),
+                1 => self.export_chosen(ExportKind::Standard),
+                2 => self.export_chosen(ExportKind::Ascii),
+                _ => {}
+            },
+            Purpose::ChangedOnDisk => {
+                if button == 0 {
+                    if let Some(source) = self.source.clone() {
+                        self.open_source(source);
+                        self.message = Some(format!("Reloaded {}", self.file_name()));
+                    }
+                } else if let Some(source) = &self.source {
+                    // Keep mine: don't ask again until it changes again.
+                    self.disk_stamp = Self::stamp(source.host());
+                }
+            }
+            Purpose::ReplaceInImage => {
+                if let Some(mut save) = self.pending_save.take()
+                    && button == 0
+                {
+                    save.replace = true;
+                    self.save_to(save);
+                }
+            }
+            Purpose::OverwriteChanged => {
+                if let Some(mut save) = self.pending_save.take()
+                    && button == 0
+                {
+                    save.overwrite = true;
+                    self.save_to(save);
+                }
+            }
+            Purpose::ImportCase => {
+                if button == 0 {
+                    self.convert_case();
+                }
+                self.pending_case = None;
+            }
+            Purpose::ExportLossy(kind) => {
+                if button == 0 {
+                    self.start_file_job(FileJobKind::Export(kind));
+                }
+            }
+            Purpose::ReopenAs => {
+                let name = d.buttons.get(button).copied();
+                let chosen = self
+                    .spec
+                    .machine
+                    .formats()
+                    .iter()
+                    .copied()
+                    .find(|f| Some(f.name()) == name);
+                if let (Some(f), Some(source)) = (chosen, self.source.clone()) {
+                    self.open_source_as(source, Some(f));
+                }
+            }
+        }
+    }
+
+    /// Offer the formats that can read the current file.
+    fn reopen_as(&mut self) {
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        let bytes = match self.read_source(&source) {
+            Ok(b) => b,
+            Err(e) => {
+                self.message = Some(format!("Can't read {}: {e}", describe(&source)));
+                return;
+            }
+        };
+        let formats: Vec<&'static str> = self
+            .spec
+            .machine
+            .formats()
+            .iter()
+            .filter(|f| f.detect(&bytes))
+            .map(|f| f.name())
+            .collect();
+        let current = formats
+            .iter()
+            .position(|&n| n == self.format.name())
+            .unwrap_or(0);
+        self.dialog = Some(Dialog::reopen_as(&self.file_name(), formats, current));
+    }
+
+    /// Test hook: press button `n` of the open dialog.
+    pub fn test_choose(&mut self, n: usize) {
+        self.dialog_choose(n);
+    }
+
+    /// Test hook: act as if Save Listing As chose `path`.
+    pub fn test_export(&mut self, path: PathBuf, kind: ExportKind) {
+        self.export_to(&path, kind);
+    }
+
+    pub fn test_export_choice(&mut self, button: usize) {
+        self.dialog = Some(Dialog::export(&self.file_name()));
+        self.dialog_choose(button);
+    }
+
+    pub fn test_save_listing_as(&mut self, path: PathBuf) {
+        self.file_job = None;
+        self.save_to(PendingSave {
+            target: Source::File(path),
+            replace: true,
+            format: self.spec.machine.text_format(),
+            then: None,
+            confirmed: false,
+            overwrite: false,
+        });
+    }
+
+    /// Test hook: open a document by its recent-files text.
+    pub fn test_open_source(&mut self, text: &str) {
+        self.open_source(Source::from_recent(text));
+    }
+
+    /// Test hook: File > Save.
+    pub fn test_save(&mut self) {
+        self.save(None);
+    }
+
+    /// Test hook: act as if Save As chose `path`.
+    pub fn test_save_as(&mut self, path: PathBuf) {
+        self.save_as_to(path, None);
+    }
+
+    /// Test hook: show the Reopen As chooser.
+    /// Files were dropped on the window (or opened from the macOS
+    /// Finder): the first opens here, as File > Open would; each other one
+    /// in a new window of its own.
+    pub fn drop_files(&mut self, paths: Vec<PathBuf>) {
+        let mut files = paths.into_iter().filter(|p| !p.is_dir());
+        let Some(first) = files.next() else {
+            self.message = Some("Folders can't be opened: drop files".into());
+            return;
+        };
+        let mut failed = 0;
+        for path in files {
+            if open_new_window(&path).is_err() {
+                failed += 1;
+            }
+        }
+        self.drop_file(first);
+        if failed > 0 {
+            self.message = Some(format!("Couldn't open {failed} more window(s)"));
+        }
+    }
+
+    /// Open a dropped file here, unless a dialog is waiting for an answer.
+    fn drop_file(&mut self, path: PathBuf) {
+        if self.dialog.is_some() || self.file_job.is_some() {
+            // Not lost: it opens in a window of its own instead.
+            let _ = open_new_window(&path);
+            return;
+        }
+        self.close_menu();
+        self.overlay = Overlay::None;
+        self.print = None;
+        if self.prefs.is_some() {
+            self.close_prefs();
+        }
+        self.dropped = Some(Source::File(path));
+        self.guard(After::OpenDropped);
+    }
+
+    pub fn test_import(&mut self, path: PathBuf) {
+        self.import_path(&path);
+    }
+
+    pub fn test_export_dialog(&mut self) {
+        self.dialog = Some(Dialog::export(&self.file_name()));
+    }
+
+    pub fn test_reopen_as(&mut self) {
+        self.reopen_as();
+    }
+
+    /// Show the About box (also used by tests).
+    pub fn show_about(&mut self) {
+        self.dialog = Some(Dialog::about(self.spec.title, &self.spec.about));
+    }
+
+    /// Write the settings file now (the "Save Preferences" button).
+    fn save_prefs(&mut self) {
+        let merged = self.config.merged(
+            &self.config_initial,
+            Config::load(self.spec.app_id),
+            &self.opened,
+        );
+        self.message = Some(match merged.save(self.spec.app_id) {
+            Ok(()) => {
+                self.config_initial = self.config.clone();
+                "Preferences saved".into()
+            }
+            Err(e) => format!("Preferences not saved: {e}"),
+        });
+    }
+
+    /// At exit: save the settings this window changed if "Save preferences
+    /// on exit" is on (other windows may have saved theirs meanwhile).
+    /// Otherwise only record that choice. The recent files and the window
+    /// size are kept either way.
+    pub fn save_prefs_on_exit(&self) -> Result<(), String> {
+        let on_disk = Config::load(self.spec.app_id);
+        let out = if self.config.save_on_exit {
+            self.config
+                .merged(&self.config_initial, on_disk.clone(), &self.opened)
+        } else {
+            // Nothing changed but the recent files, the window size and the
+            // choice itself.
+            let mut out = on_disk.merged(&on_disk, on_disk.clone(), &self.opened);
+            out.save_on_exit = false;
+            out.window_size = self.config.window_size;
+            out.window_maximized = self.config.window_maximized;
+            out
+        };
+        if out == on_disk {
+            return Ok(());
+        }
+        out.save(self.spec.app_id)
+    }
+
+    /// Put a file opened or saved at the top of the recent files.
+    fn note_recent(&mut self, source: &Source) {
+        let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let full = match source {
+            Source::File(p) => Source::File(absolute(p)),
+            Source::Image { image, path } => Source::Image {
+                image: absolute(image),
+                path: path.clone(),
+            },
+        };
+        let p = full.to_recent();
+        for list in [&mut self.opened, &mut self.config.recent] {
+            list.retain(|q| q != &p);
+            list.insert(0, p.clone());
+            list.truncate(config::MAX_RECENT);
+        }
+        self.menus = menu::menus(
+            self.alt_charset,
+            &self.config.recent,
+            self.spec.disks.is_some(),
+        );
+    }
+
+    /// File > (recent file `n`): open it, after "Save changes?".
+    fn open_recent(&mut self, n: usize) {
+        let Some(p) = self.config.recent.get(n).cloned() else {
+            return;
+        };
+        let source = Source::from_recent(&p);
+        if !source.host().is_file() {
+            let gone = match &source {
+                Source::File(_) => p.clone(),
+                Source::Image { image, .. } => image.to_string_lossy().into_owned(),
+            };
+            self.message = Some(format!("{gone} is no longer there"));
+            self.config.recent.retain(|q| q != &p);
+            self.opened.retain(|q| q != &p);
+            self.menus = menu::menus(
+                self.alt_charset,
+                &self.config.recent,
+                self.spec.disks.is_some(),
+            );
+            return;
+        }
+        self.dropped = Some(source);
+        self.guard(After::OpenDropped);
+    }
+
+    // ----- changes made by other programs ----------------------------------------
+
+    /// The file's modification time and size, if it can be read.
+    fn stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+        let m = std::fs::metadata(path).ok()?;
+        Some((m.modified().ok()?, m.len()))
+    }
+
+    /// Whether another program has changed the file (or the disk image
+    /// it's in) since it was read or written here.
+    fn changed_on_disk(&self) -> bool {
+        match (&self.source, self.disk_stamp) {
+            (Some(source), Some(old)) => Self::stamp(source.host()).is_some_and(|now| now != old),
+            _ => false,
+        }
+    }
+
+    /// The window became active again: if another program changed the
+    /// file, reload it (asking first if there are unsaved changes). For a
+    /// file in a disk image, only a change to that file counts: other
+    /// files in the image may change freely.
+    pub fn check_disk(&mut self) {
+        if self.dialog.is_some() || self.file_job.is_some() || !self.changed_on_disk() {
+            return;
+        }
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        if let Source::Image { image, .. } = &source {
+            match self.read_source(&source) {
+                Ok(bytes) if Some(&bytes) == self.image_copy.as_ref() => {
+                    self.disk_stamp = Self::stamp(image);
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // Say so once, and keep what's here; Save puts it back.
+                    self.disk_stamp = Self::stamp(image);
+                    self.message = Some(format!("Can't read {}: {e}", source.label()));
+                    return;
+                }
+            }
+        }
+        if self.editor.doc.is_modified() {
+            self.dialog = Some(Dialog::changed_on_disk(&self.file_name()));
+        } else {
+            self.open_source(source);
+            self.message = Some(format!(
+                "Reloaded {}: another program changed it",
+                self.file_name()
+            ));
+        }
+    }
+
+    // ----- settings ----------------------------------------------------------
+
+    fn set_wrap(&mut self, native: bool) {
+        self.config.wrap = if native {
+            WrapMode::Native
+        } else {
+            WrapMode::Window
+        };
+        self.editor.wrap = self.config.wrap;
+    }
+
+    fn set_scale(&mut self, scale: i32) {
+        self.config.scale = scale.clamp(config::MIN_SCALE as i32, config::MAX_SCALE as i32) as u32;
+    }
+
+    fn set_charset(&mut self, index: usize) {
+        let index = index % self.spec.machine.charsets().len();
+        self.spec.machine.set_charset(index);
+        self.spec.keyboard.set_charset(index);
+        self.config.charset = index;
+        self.charset_changed = true;
+    }
+
+    // ----- find and go to line ----------------------------------------------
+
+    /// A one-line editor for the Find and Replace fields.
+    fn field_editor(&self, codes: Vec<u8>) -> Editor {
+        let mut e = Editor::new(
+            Document::from_lines(vec![codes], false),
+            WrapMode::Window,
+            self.spec.machine.default_tab_stops(),
+        );
+        e.doc.line_end();
+        e
+    }
+
+    /// The fields' layout: one long row (the view scrolls it sideways).
+    fn field_layout(&self) -> Layout {
+        Layout::new(
+            WrapMode::Window,
+            FIELD_MAX,
+            1,
+            self.spec.machine.screen_columns(),
+            0,
+        )
+    }
+
+    /// The open Find panel, if it has the keys.
+    fn active_find(&self) -> Option<&FindPage> {
+        self.find.as_ref().filter(|p| p.active)
+    }
+
+    /// The Atari text field with the focus, if one has it.
+    fn focused_field(&mut self) -> Option<&mut Editor> {
+        match self.find.as_ref()?.focused() {
+            find_page::Field::FindText => Some(&mut self.find_field),
+            find_page::Field::ReplaceText => Some(&mut self.replace_field),
+            _ => None,
+        }
+    }
+
+    fn match_rule(&self) -> search::Match {
+        search::Match {
+            case: self.match_case,
+            inverse: self.match_inverse,
+        }
+    }
+
+    /// The text to find, and to replace it with.
+    fn find_codes(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            self.find_field.doc.line(0).to_vec(),
+            self.replace_field.doc.line(0).to_vec(),
+        )
+    }
+
+    /// The find text for messages, with tags for Atari characters.
+    fn find_label(&self) -> String {
+        self.spec.machine.export_ascii(self.find_field.doc.line(0))
+    }
+
+    /// Edit > Find (or Replace): open the panel, starting with the
+    /// selected text if it's on one line.
+    fn open_find(&mut self, replace: bool) {
+        self.close_menu();
+        if let Some((a, b)) = self.editor.selection()
+            && a.line == b.line
+        {
+            let codes = self.editor.doc.lines()[a.line][a.col..b.col].to_vec();
+            self.find_field = self.field_editor(codes);
+        }
+        let focus = if replace && !self.find_field.doc.line(0).is_empty() {
+            find_page::Field::ReplaceText
+        } else {
+            find_page::Field::FindText
+        };
+        self.find = Some(FindPage::new(find_page::Mode::Find, focus));
+    }
+
+    fn open_goto(&mut self) {
+        self.close_menu();
+        self.line_text.clear();
+        self.find = Some(FindPage::new(
+            find_page::Mode::GoTo,
+            find_page::Field::LineText,
+        ));
+    }
+
+    /// Find Next (or Previous): select the next match, wrapping round.
+    fn find_next(&mut self, forward: bool, layout: &Layout) {
+        let (pat, _) = self.find_codes();
+        if pat.is_empty() {
+            self.open_find(false);
+            return;
+        }
+        let from = match self.editor.selection() {
+            Some((a, _)) if !forward => a,
+            _ => self.editor.doc.cursor(),
+        };
+        match search::find(
+            self.editor.doc.lines(),
+            &pat,
+            from,
+            forward,
+            self.match_rule(),
+        ) {
+            Some(p) => {
+                let end = Pos {
+                    line: p.line,
+                    col: p.col + pat.len(),
+                };
+                self.editor.select_range(p, end, layout);
+                self.message = None;
+            }
+            None => self.message = Some(format!("Not found: {}", self.find_label())),
+        }
+    }
+
+    /// Replace: if the selection is a match, replace it; then find the next.
+    fn replace_one(&mut self, layout: &Layout) {
+        let (pat, with) = self.find_codes();
+        if let Some((a, b)) = self.editor.selection()
+            && a.line == b.line
+            && b.col == a.col + pat.len()
+            && search::is_match(self.editor.doc.lines(), a, &pat, self.match_rule())
+        {
+            self.editor.paste(&[with], layout);
+        }
+        self.find_next(true, layout);
+    }
+
+    fn replace_all(&mut self, layout: &Layout) {
+        let (pat, with) = self.find_codes();
+        let at = search::find_all(self.editor.doc.lines(), &pat, self.match_rule());
+        if at.is_empty() {
+            self.message = Some(format!("Not found: {}", self.find_label()));
+            return;
+        }
+        self.editor.replace_matches(&at, pat.len(), &with, layout);
+        self.message = Some(format!(
+            "Replaced {} occurrence{}",
+            at.len(),
+            if at.len() == 1 { "" } else { "s" }
+        ));
+    }
+
+    fn go_to_line(&mut self, layout: &Layout) {
+        let Ok(n) = self.line_text.trim().parse::<u32>() else {
+            self.message = Some("Type a line number".into());
+            return;
+        };
+        let (pos, how) =
+            search::go_to_line(self.editor.doc.lines(), n, !self.config.goto_editor_line);
+        self.editor.click(pos, false);
+        self.editor.scroll_to_cursor(layout);
+        self.find = None;
+        self.message = match how {
+            search::GoTo::Found => None,
+            search::GoTo::Next(m) => Some(format!("There's no line {n}: went to line {m}")),
+            search::GoTo::After(m) => Some(format!("There's no line {n}: went past line {m}")),
+            search::GoTo::Last => Some(format!("There's no line {n}: went to the last line")),
+        };
+    }
+
+    /// Close the Find or Go to Line panel, and its message with it.
+    fn close_find(&mut self) {
+        self.find = None;
+        self.message = None;
+    }
+
+    fn find_apply(&mut self, f: find_page::Field, op: Op, layout: &Layout) {
+        use find_page::Field as F;
+        match (f, op) {
+            (F::MatchCase, Op::Toggle) => self.match_case = !self.match_case,
+            (F::MatchInverse, Op::Toggle) => self.match_inverse = !self.match_inverse,
+            (F::EditorLine, Op::Toggle) => {
+                self.config.goto_editor_line = !self.config.goto_editor_line
+            }
+            (F::FindNext, Op::Press) => self.find_next(true, layout),
+            (F::ReplaceOne, Op::Press) => self.replace_one(layout),
+            (F::ReplaceAll, Op::Press) => self.replace_all(layout),
+            (F::Go, Op::Press) => self.go_to_line(layout),
+            (F::Close, Op::Press) => self.close_find(),
+            _ => {}
+        }
+    }
+
+    /// A click on the panel: on an Atari field, also put its cursor there.
+    fn find_click(&mut self, x: i32, y: i32, shift: bool, f: &Frame) -> bool {
+        let Some(p) = &mut self.find else {
+            return false;
+        };
+        // A click in the text gives the keys back to the document.
+        p.active = p.contains(x, y);
+        let Some((field, op)) = p.hit(x, y) else {
+            return p.active;
+        };
+        p.focus_on(field);
+        let spot = p
+            .fields
+            .iter()
+            .find(|(g, _)| *g == field)
+            .map(|&(_, r)| (r, p.cell));
+        if let Some((r, cell)) = spot {
+            let i = usize::from(field == find_page::Field::ReplaceText);
+            let col = self.field_scroll[i] + ((x - r.x()).max(0) / cell) as usize;
+            if let Some(e) = self.focused_field() {
+                e.click(Pos { line: 0, col }, shift);
+            }
+        } else {
+            self.find_apply(field, op, &f.layout);
+        }
+        true
+    }
+
+    /// A key pressed while the Find or Go to Line panel is open. Returns
+    /// true if the panel used it; other keys go on to the Atari field
+    /// with the focus, if any, as if typed in the document.
+    fn find_key(&mut self, k: Keycode, shift: bool, layout: &Layout) -> bool {
+        use find_page::Field as F;
+        let Some(p) = &mut self.find else {
+            return false;
+        };
+        let f = p.focused();
+        let go_to = p.mode == find_page::Mode::GoTo;
+        match k {
+            Keycode::TAB => p.move_focus(if shift { -1 } else { 1 }),
+            Keycode::F3 => self.find_next(!shift, layout),
+            Keycode::RETURN | Keycode::KP_ENTER => match f {
+                F::ReplaceOne | F::ReplaceAll | F::Close | F::Go => {
+                    self.find_apply(f, Op::Press, layout)
+                }
+                // Anywhere else in Go to Line (the box, the Editor line
+                // check box), Enter goes to the line.
+                _ if go_to => self.go_to_line(layout),
+                _ => self.find_next(!shift, layout),
+            },
+            // In the Atari fields Esc is the Atari Esc key, as in the text.
+            Keycode::ESCAPE if !f.is_atari() => self.close_find(),
+            Keycode::BACKSPACE if f == F::LineText => {
+                self.line_text.pop();
+            }
+            Keycode::SPACE if !f.is_text() => {
+                self.find_apply(f, Op::Toggle, layout);
+                self.find_apply(f, Op::Press, layout);
+            }
+            // Anything else isn't the panel's: an Atari field takes it as
+            // a key, and the Go to Line box the text it types.
+            _ => return false,
+        }
+        true
+    }
+
+    /// Ctrl+A / C / X / V in an Atari field: select all, copy, cut, paste
+    /// (one line).
+    fn field_clipboard(&mut self, k: Keycode, clipboard: &ClipboardUtil) {
+        let layout = self.field_layout();
+        let machine = self.spec.machine.as_ref();
+        let paste = (k == Keycode::V)
+            .then(|| clipboard.clipboard_text().ok())
+            .flatten()
+            .map(|t| retro_core::clipboard::from_text(&t, machine).0);
+        let Some(e) = (match self.find.as_ref().map(|p| p.focused()) {
+            Some(find_page::Field::FindText) => Some(&mut self.find_field),
+            Some(find_page::Field::ReplaceText) => Some(&mut self.replace_field),
+            _ => None,
+        }) else {
+            return;
+        };
+        let copied = match k {
+            Keycode::A => {
+                e.select_all();
+                None
+            }
+            Keycode::C => e.copy(),
+            Keycode::X => e.cut(&layout),
+            Keycode::V => {
+                if let Some(first) = paste.and_then(|lines| lines.into_iter().next()) {
+                    e.paste(&[first], &layout);
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(lines) = copied {
+            let text = retro_core::clipboard::to_text(&lines, machine);
+            let _ = clipboard.set_clipboard_text(&text);
+        }
+    }
+
+    /// Text typed in the Go to Line field (digits only).
+    fn line_text_input(&mut self, text: &str) {
+        self.line_text
+            .extend(text.chars().filter(char::is_ascii_digit));
+    }
+
+    /// The values the panel shows.
+    pub fn find_view(&self) -> find_page::View<'_> {
+        find_page::View {
+            match_case: self.match_case,
+            match_inverse: self.match_inverse,
+            line: &self.line_text,
+            editor_line: self.config.goto_editor_line,
+        }
+    }
+
+    pub fn test_go_to(&mut self, line: &str, layout: &Layout) {
+        self.open_goto();
+        self.line_text_input(line);
+        self.go_to_line(layout);
+    }
+
+    pub fn test_open_find(&mut self, text: &str, layout: &Layout) {
+        self.open_find(false);
+        let codes = self
+            .spec
+            .machine
+            .import_text(text.as_bytes())
+            .lines
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        self.find_field = self.field_editor(codes);
+        self.find_next(true, layout);
+    }
+
+    // ----- open from image -------------------------------------------------------
+
+    /// File > Open from Image: show the page on the image last used (the
+    /// document's own, else the latest in the recent files), or ask for
+    /// one.
+    fn open_image_page(&mut self, mode: image_page::Mode) {
+        let mut page = self.new_image_page(mode);
+        if mode == image_page::Mode::Save {
+            page.set_name(&self.image_name());
+        }
+        self.image_page = Some(page);
+        let own = match &self.source {
+            Some(Source::Image { image, .. }) => Some(image.clone()),
+            _ => None,
+        };
+        let recent = || {
+            self.config
+                .recent
+                .iter()
+                .find_map(|r| match Source::from_recent(r) {
+                    Source::Image { image, .. } if image.is_file() => Some(image),
+                    _ => None,
+                })
+        };
+        match own.or_else(recent) {
+            Some(image) => self.load_image_page(image),
+            None => self.start_file_job(FileJobKind::ChooseImage),
+        }
+    }
+
+    /// The OS dialog for choosing a disk image.
+    fn image_dialog(&self) -> rfd::FileDialog {
+        let mut d = rfd::FileDialog::new().set_title("Choose Image");
+        // As for Open: the macOS panel has no file-type menu, so a filter
+        // there would hide every other file with no way to show them.
+        if let Some(disks) = self
+            .spec
+            .disks
+            .as_ref()
+            .filter(|_| !cfg!(target_os = "macos"))
+        {
+            let exts: Vec<String> = disks
+                .extensions()
+                .iter()
+                .flat_map(|e| [e.to_ascii_uppercase(), e.to_ascii_lowercase()])
+                .collect();
+            let shown: Vec<String> = disks.extensions().iter().map(|e| format!(".{e}")).collect();
+            d = d.add_filter(format!("{} ({})", disks.name(), shown.join(", ")), &exts);
+        }
+        if !cfg!(target_os = "macos") {
+            d = d.add_filter("All files", &["*"]);
+        }
+        // Beside the image shown, if any.
+        match self
+            .image_page
+            .as_ref()
+            .and_then(|p| p.image.as_ref())
+            .and_then(|i| i.parent())
+            .filter(|d| d.is_dir())
+        {
+            Some(dir) => d.set_directory(dir),
+            None => self.in_start_dir(d, false),
+        }
+    }
+
+    /// Read `image` and show it on the page. When the document came from
+    /// it, start in the document's directory with its file selected.
+    fn load_image_page(&mut self, image: PathBuf) {
+        let vol = self.open_image(&image);
+        let Some(p) = &mut self.image_page else {
+            return;
+        };
+        match vol {
+            Ok(vol) => {
+                let top = self
+                    .spec
+                    .disks
+                    .as_ref()
+                    .map_or(b"/".to_vec(), |d| d.top_directory().to_vec());
+                p.load(image.clone(), vol, top);
+                if let Some(Source::Image { image: own, path }) = &self.source
+                    && *own == image
+                    && let Some((name, dir)) = path.split_last()
+                {
+                    p.select_path(dir, name);
+                    if p.mode == image_page::Mode::Save {
+                        p.set_name(name);
+                    }
+                }
+            }
+            Err(e) => p.failed(image, e.to_string()),
+        }
+    }
+
+    /// Do what the page asked.
+    fn image_action(&mut self, action: image_page::Action) {
+        use image_page::Action as A;
+        match action {
+            A::None => {}
+            A::Close => self.image_page = None,
+            A::Choose => self.start_file_job(FileJobKind::ChooseImage),
+            A::MakeDir => self.make_image_dir(),
+            A::OpenNewImage => {
+                if let (Some(p), Some(disks)) = (&mut self.image_page, &self.spec.disks) {
+                    p.new_image = Some(NewImagePopup::new(disks.as_ref()));
+                }
+            }
+            A::CreateImage => self.create_image(),
+            A::Save => {
+                let Some(p) = &self.image_page else { return };
+                let Some(image) = p.image.clone() else { return };
+                let target = Source::Image {
+                    image,
+                    path: p.path_of(&p.name),
+                };
+                self.save_as_target(target, None);
+            }
+            A::Open => {
+                let Some(p) = &self.image_page else { return };
+                let (Some(image), Some(path)) = (p.image.clone(), p.selected_file()) else {
+                    return;
+                };
+                let source = Source::Image { image, path };
+                // Keep the page if the file can't be read, saying why.
+                if let Err(e) = self.read_source(&source) {
+                    if let Some(p) = &mut self.image_page {
+                        p.error = Some(format!("{}: {e}", source.name()));
+                    }
+                    return;
+                }
+                self.image_page = None;
+                self.note_folder(source.host());
+                self.open_source(source);
+            }
+        }
+    }
+
+    /// An empty image page; New Image works if the machine can format.
+    fn new_image_page(&self, mode: image_page::Mode) -> ImagePage {
+        let mut page = ImagePage::new(mode);
+        page.can_new_image = self
+            .spec
+            .disks
+            .as_ref()
+            .is_some_and(|d| !d.new_systems().is_empty());
+        page
+    }
+
+    /// New Image's Create...: format the disk in memory (saying in the
+    /// pop-up why it can't be), then ask where to save it.
+    fn create_image(&mut self) {
+        let (Some(disks), Some(pop)) = (
+            &self.spec.disks,
+            self.image_page.as_mut().and_then(|p| p.new_image.as_mut()),
+        ) else {
+            return;
+        };
+        let made = pop
+            .request()
+            .and_then(|req| disks.format(&req).map_err(|e| sentence(&e.message)));
+        match made {
+            Ok(vol) => {
+                self.new_image_bytes = Some(vol.to_bytes());
+                self.start_file_job(FileJobKind::NewImage);
+            }
+            Err(e) => pop.error = Some(e),
+        }
+    }
+
+    /// The OS Save dialog for a new image.
+    fn new_image_dialog(&self) -> rfd::FileDialog {
+        let pop = self.image_page.as_ref().and_then(|p| p.new_image.as_ref());
+        let name = pop.map_or("NEWDISK.ATR".into(), |p| p.file_name());
+        let mut d = rfd::FileDialog::new()
+            .set_title("New Image")
+            .set_file_name(name);
+        if let Some(ext) = pop.map(|p| p.extension()) {
+            d = d.add_filter(
+                format!(".{ext} images"),
+                &[ext.to_ascii_uppercase(), ext.to_ascii_lowercase()],
+            );
+        }
+        match self
+            .image_page
+            .as_ref()
+            .and_then(|p| p.image.as_ref())
+            .and_then(|i| i.parent())
+            .filter(|d| d.is_dir())
+        {
+            Some(dir) => d.set_directory(dir),
+            None => self.in_start_dir(d, true),
+        }
+    }
+
+    /// The Save dialog chose `path` for the new image: write it, and show
+    /// it on the page.
+    fn write_new_image(&mut self, mut path: PathBuf) {
+        let Some(bytes) = self.new_image_bytes.take() else {
+            return;
+        };
+        let ext = self
+            .image_page
+            .as_ref()
+            .and_then(|p| p.new_image.as_ref())
+            .map(|p| p.extension());
+        if path.extension().is_none()
+            && let Some(ext) = ext
+        {
+            path.set_extension(ext);
+        }
+        if let Err(e) = write_atomically(&path, &bytes) {
+            if let Some(pop) = self.image_page.as_mut().and_then(|p| p.new_image.as_mut()) {
+                pop.error = Some(format!("Can't save it: {e}"));
+            }
+            return;
+        }
+        self.note_folder(&path);
+        if let Some(p) = &mut self.image_page {
+            p.new_image = None;
+        }
+        self.load_image_page(path);
+    }
+
+    /// Test hook: on the Save to Image page, open New Image and press
+    /// `keys` in it ("tab,right,type:GAMES"), then Create into `path`
+    /// (without the Save dialog).
+    pub fn test_new_image(&mut self, keys: &str, path: Option<PathBuf>) {
+        self.image_action(image_page::Action::OpenNewImage);
+        self.test_image_keys(keys);
+        if let Some(path) = path {
+            self.create_image();
+            if self.new_image_bytes.is_some() {
+                self.file_job = None;
+                self.message = None;
+                self.write_new_image(path);
+            }
+        }
+    }
+
+    /// Create Directory: make the directory named in the pop-up inside
+    /// the one shown, in a fresh copy of the image, and save the image.
+    /// Then show the new directory; on failure, say why in the pop-up.
+    fn make_image_dir(&mut self) {
+        let Some(p) = &self.image_page else { return };
+        let (Some(image), Some(pop)) = (p.image.clone(), &p.new_dir) else {
+            return;
+        };
+        let path = p.path_of(&pop.name);
+        let done = self.open_image(&image).and_then(|mut vol| {
+            vol.make_dir(&path, local_time::now())
+                .map_err(SourceError::Disk)?;
+            write_atomically(&image, &vol.to_bytes()).map_err(SourceError::Io)
+        });
+        if let Err(e) = done {
+            if let Some(pop) = self.image_page.as_mut().and_then(|p| p.new_dir.as_mut()) {
+                pop.error = Some(sentence(&e.to_string()));
+            }
+            return;
+        }
+        // The document's own image changed here, not by another program.
+        if self.source.as_ref().map(Source::host) == Some(image.as_path()) {
+            self.disk_stamp = Self::stamp(&image);
+        }
+        // Show it, keeping the name typed in the File name box.
+        let name = self.image_page.as_ref().map(|p| p.name.clone());
+        self.load_image_page(image);
+        if let Some(p) = &mut self.image_page {
+            p.show_path(&path);
+            if let Some(name) = name {
+                p.set_name(&name);
+            }
+        }
+    }
+
+    /// The name Save to Image suggests: the document's own name on the
+    /// disk if it came from an image, otherwise the name Save As would
+    /// suggest, in machine codes (the page cuts it to suit the disk).
+    fn image_name(&self) -> Vec<u8> {
+        if let Some(Source::Image { path, .. }) = &self.source
+            && let Some(name) = path.last()
+        {
+            return name.clone();
+        }
+        let name = match &self.source {
+            Some(_) => self.save_name(),
+            None => with_extension_like("UNTITLED", self.spec.machine.text_format().extension()),
+        };
+        name.chars()
+            .map(|c| self.spec.machine.ascii_code(c))
+            .collect()
+    }
+
+    /// Test hook: File > Open from Image or Save to Image (without "Save
+    /// changes?"), showing `image` if given.
+    pub fn test_open_image_page(&mut self, save: bool, image: Option<PathBuf>) {
+        let mode = if save {
+            image_page::Mode::Save
+        } else {
+            image_page::Mode::Open
+        };
+        match image {
+            Some(image) => {
+                let mut page = self.new_image_page(mode);
+                if save {
+                    page.set_name(&self.image_name());
+                }
+                self.image_page = Some(page);
+                self.load_image_page(image);
+            }
+            None => self.open_image_page(mode),
+        }
+    }
+
+    /// Test hook: type text on the image page.
+    pub fn test_image_type(&mut self, text: &str) {
+        let codes: Vec<u8> = text
+            .chars()
+            .filter_map(|c| self.spec.machine.code_for_char(c))
+            .collect();
+        if let Some(p) = &mut self.image_page {
+            p.type_codes(&codes);
+        }
+    }
+
+    /// Test hook: keys on the Open from Image page, e.g. "down,down,tab".
+    pub fn test_image_keys(&mut self, keys: &str) {
+        for k in keys.split(',').map(str::trim) {
+            if let Some(text) = k.strip_prefix("type:") {
+                self.test_image_type(text);
+                continue;
+            }
+            let (shift, name) = match k.strip_prefix("shift+") {
+                Some(n) => (true, n),
+                None => (false, k),
+            };
+            let Some(code) = Keycode::from_name(name) else {
+                continue;
+            };
+            if let Some(p) = &mut self.image_page {
+                let action = p.key(code, shift);
+                self.image_action(action);
+            }
+        }
+    }
+
+    // ----- fonts -----------------------------------------------------------------
+
+    /// How many character sets can have a font (at most two).
+    fn font_sets(&self) -> usize {
+        self.spec.machine.charsets().len().min(2)
+    }
+
+    /// At startup: load the font files chosen in the settings. One that
+    /// can't be read is left out (the built-in set is used), with a
+    /// message; the setting is kept, in case the file comes back.
+    pub fn load_fonts(&mut self) {
+        let mut failed = Vec::new();
+        for i in 0..self.font_sets() {
+            let path = self.config.fonts[i].clone();
+            if path.is_empty() || self.config.font_builtin[i] {
+                continue;
+            }
+            let result = std::fs::read(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| self.spec.machine.load_font(i, Some(&bytes)));
+            if result.is_err() {
+                failed.push(file_label(&path));
+            }
+        }
+        if !failed.is_empty() {
+            self.message = Some(format!(
+                "Font {} not loaded: using the built-in one",
+                failed.join(" and ")
+            ));
+        }
+        self.charset_changed = true;
+    }
+
+    /// Use font file `path` for character set `i`, or the built-in one.
+    fn set_font(&mut self, i: usize, path: Option<&Path>) {
+        let Some(path) = path else {
+            let _ = self.spec.machine.load_font(i, None);
+            self.config.font_builtin[i] = true;
+            self.charset_changed = true;
+            return;
+        };
+        let result = std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| self.spec.machine.load_font(i, Some(&bytes)));
+        let name = file_label(&path.to_string_lossy());
+        match result {
+            Ok(()) => {
+                self.config.fonts[i] = std::path::absolute(path)
+                    .unwrap_or_else(|_| path.to_path_buf())
+                    .to_string_lossy()
+                    .into_owned();
+                self.config.font_builtin[i] = false;
+                self.charset_changed = true;
+                self.message = Some(format!("Font: {name}"));
+            }
+            Err(e) => {
+                self.dialog = Some(Dialog::notice(
+                    "Not a font",
+                    &format!("{name} can't be used as a font:\n{e}."),
+                ));
+            }
+        }
+    }
+
+    pub fn open_fonts(&mut self) {
+        self.close_menu();
+        self.overlay = Overlay::None;
+        self.fonts = Some(FontsPage::new(self.font_sets()));
+    }
+
+    /// The values the Fonts page shows.
+    pub fn fonts_view(&self) -> fonts_page::View {
+        let machine = self.spec.machine.as_ref();
+        let names = machine.charsets();
+        let sets = (0..self.font_sets())
+            .map(|i| fonts_page::SetView {
+                name: names[i],
+                file: (!self.config.fonts[i].is_empty()).then(|| file_label(&self.config.fonts[i])),
+                builtin: self.config.font_builtin[i],
+                glyphs: (0..128u8).map(|c| machine.charset_glyph(i, c)).collect(),
+            })
+            .collect();
+        let c = self.screen_colors();
+        fonts_page::View {
+            sets,
+            background: c.background,
+            text: c.text,
+        }
+    }
+
+    fn fonts_apply(&mut self, f: fonts_page::Field) {
+        use fonts_page::Field as F;
+        match f {
+            F::Browse(i) => {
+                self.fonts = None;
+                self.start_file_job(FileJobKind::Font(i));
+            }
+            // Tick: the built-in set; untick: the font file back.
+            F::BuiltIn(i) => {
+                if self.config.font_builtin[i] {
+                    let path = PathBuf::from(&self.config.fonts[i]);
+                    if !self.config.fonts[i].is_empty() {
+                        self.set_font(i, Some(&path));
+                    }
+                } else {
+                    self.set_font(i, None);
+                    self.message = Some("Built-in font".into());
+                }
+            }
+            F::Close => self.fonts = None,
+        }
+    }
+
+    fn fonts_key(&mut self, k: Keycode, shift: bool) {
+        let Some(p) = &mut self.fonts else { return };
+        let f = p.focused();
+        match k {
+            Keycode::TAB | Keycode::RIGHT | Keycode::DOWN => {
+                p.move_focus(if shift && k == Keycode::TAB { -1 } else { 1 })
+            }
+            Keycode::LEFT | Keycode::UP => p.move_focus(-1),
+            Keycode::ESCAPE => self.fonts = None,
+            Keycode::RETURN | Keycode::KP_ENTER | Keycode::SPACE => self.fonts_apply(f),
+            _ => {}
+        }
+    }
+
+    pub fn test_open_fonts(&mut self) {
+        self.open_fonts();
+    }
+
+    pub fn test_set_font(&mut self, i: usize, path: &Path) {
+        self.set_font(i, Some(path));
+    }
+
+    // ----- print page ----------------------------------------------------------
+
+    pub fn open_print(&mut self) {
+        self.close_menu();
+        self.overlay = Overlay::None;
+        self.print = Some(PrintPage::new());
+    }
+
+    fn print_settings(&self) -> PrintSettings {
+        PrintSettings {
+            paper: self.config.print_paper,
+            columns: (!self.config.print_fill).then_some(40),
+            size: self.config.print_size as f32,
+            header: self.config.print_header,
+            line_numbers: self.config.print_line_numbers,
+        }
+    }
+
+    /// The values shown on the Print page.
+    pub fn print_view(&self) -> print_page::View {
+        let s = self.print_settings();
+        let l = s.layout();
+        let pages = retro_core::print::page_count(self.editor.doc.lines(), &s);
+        let plural = |n: usize, what: &str| {
+            if n == 1 {
+                format!("1 {what}")
+            } else {
+                format!("{n} {what}s")
+            }
+        };
+        let summary = if s.columns.is_some_and(|n| n > l.columns) {
+            format!(
+                "Only {} fit across at this size; {}",
+                plural(l.columns, "character"),
+                plural(pages, "page")
+            )
+        } else {
+            format!(
+                "{} a line, {} a page; {}",
+                plural(l.columns, "character"),
+                plural(l.rows, "line"),
+                plural(pages, "page")
+            )
+        };
+        print_page::View {
+            paper: usize::from(self.config.print_paper == Paper::A4),
+            width: usize::from(self.config.print_fill),
+            size: self.config.print_size,
+            header: self.config.print_header,
+            line_numbers: self.config.print_line_numbers,
+            open_after: self.config.print_open,
+            summary,
+        }
+    }
+
+    fn print_apply(&mut self, f: print_page::Field, op: Op) {
+        use print_page::Field as P;
+        match (f, op) {
+            (P::Paper, Op::Choose(i)) => {
+                self.config.print_paper = if i == 0 { Paper::Letter } else { Paper::A4 }
+            }
+            (P::Width, Op::Choose(i)) => self.config.print_fill = i == 1,
+            (P::Size, Op::Dec | Op::Inc) => {
+                let n = self.config.print_size;
+                self.config.print_size = if op == Op::Inc { n + 1 } else { n - 1 }
+                    .clamp(config::MIN_PRINT_SIZE, config::MAX_PRINT_SIZE);
+            }
+            (P::Header, Op::Toggle) => self.config.print_header = !self.config.print_header,
+            (P::LineNumbers, Op::Toggle) => {
+                self.config.print_line_numbers = !self.config.print_line_numbers
+            }
+            (P::OpenAfter, Op::Toggle) => self.config.print_open = !self.config.print_open,
+            (P::Save, Op::Press) => {
+                self.print = None;
+                self.start_file_job(FileJobKind::SavePdf);
+            }
+            (P::Cancel, Op::Press) => self.print = None,
+            _ => {}
+        }
+    }
+
+    /// A key pressed while the Print page is open. Every key is used up.
+    fn print_key(&mut self, k: Keycode, shift: bool) {
+        use print_page::Field as P;
+        let Some(p) = &mut self.print else { return };
+        let f = p.focused();
+        let choice = match f {
+            P::Paper => Some(usize::from(self.config.print_paper == Paper::A4)),
+            P::Width => Some(usize::from(self.config.print_fill)),
+            _ => None,
+        };
+        match k {
+            Keycode::TAB => p.move_focus(if shift { -1 } else { 1 }),
+            Keycode::UP => p.move_focus(-1),
+            Keycode::DOWN => p.move_focus(1),
+            Keycode::ESCAPE => self.print = None,
+            Keycode::RETURN | Keycode::KP_ENTER => match f {
+                P::Cancel => self.print_apply(f, Op::Press),
+                _ => self.print_apply(P::Save, Op::Press),
+            },
+            Keycode::LEFT | Keycode::RIGHT => {
+                if let Some(cur) = choice {
+                    self.print_apply(f, Op::Choose(1 - cur));
+                } else if f == P::Size {
+                    let op = if k == Keycode::RIGHT {
+                        Op::Inc
+                    } else {
+                        Op::Dec
+                    };
+                    self.print_apply(f, op);
+                }
+            }
+            Keycode::SPACE => match choice {
+                Some(cur) => self.print_apply(f, Op::Choose(1 - cur)),
+                None => {
+                    self.print_apply(f, Op::Toggle);
+                    self.print_apply(f, Op::Press);
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// The document as a PDF with the current print settings.
+    fn print_pdf(&self) -> (Vec<u8>, usize) {
+        let s = self.print_settings();
+        let lines = self.editor.doc.lines();
+        let pdf = retro_core::print::pdf(
+            self.spec.machine.as_ref(),
+            lines,
+            &self.file_name(),
+            self.spec.title,
+            &s,
+        );
+        (pdf, retro_core::print::page_count(lines, &s))
+    }
+
+    fn save_pdf(&mut self, path: &Path) {
+        let (pdf, pages) = self.print_pdf();
+        match write_atomically(path, &pdf) {
+            Ok(()) => {
+                self.note_folder(path);
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let pages = format!("{pages} page{}", if pages == 1 { "" } else { "s" });
+                self.message = Some(if !self.config.print_open {
+                    format!("Saved {name} ({pages})")
+                } else {
+                    match open_in_viewer(path) {
+                        Ok(()) => format!("Saved {name} ({pages}) and opened it to print"),
+                        Err(e) => format!("Saved {name} ({pages}); can't open it: {e}"),
+                    }
+                });
+            }
+            Err(e) => self.message = Some(format!("Save failed: {e}")),
+        }
+    }
+
+    pub fn test_open_print(&mut self) {
+        self.open_print();
+    }
+
+    /// Test hook: save the printout, without opening a PDF viewer.
+    pub fn test_save_pdf(&mut self, path: PathBuf) {
+        let open = std::mem::replace(&mut self.config.print_open, false);
+        self.save_pdf(&path);
+        self.config.print_open = open;
+    }
+
+    // ----- preferences page ----------------------------------------------------
+
+    pub fn open_prefs(&mut self, focus: Field) {
+        self.close_menu();
+        self.overlay = Overlay::None;
+        let mut p = Prefs::new(
+            self.spec.colors.is_some(),
+            self.spec.colors.is_some_and(|c| c.lums > 1),
+        );
+        p.focus_on(focus);
+        self.prefs = Some(p);
+    }
+
+    fn close_prefs(&mut self) {
+        if self.config.line_warning == 0 {
+            self.config.line_warning = config::DEFAULT_LINE_WARNING;
+        }
+        self.prefs = None;
+    }
+
+    /// The values shown on the Preferences page.
+    pub fn prefs_view(&self) -> prefs::View<'_> {
+        prefs::View {
+            native: self.config.wrap == WrapMode::Native,
+            native_label: format!("{} columns", self.spec.machine.screen_columns()),
+            line_numbers: self.config.line_numbers,
+            scale: self.config.scale,
+            charsets: self.spec.machine.charsets(),
+            charset: self.spec.machine.charset(),
+            control_alt: self.config.control_key.alt,
+            control_right: self.config.control_key.right,
+            commodore_alt: self.config.commodore_key.alt,
+            commodore_right: self.config.commodore_key.right,
+            warn_on: self.config.line_warning_on,
+            warn_col: self.config.line_warning,
+            dir_fixed: self.config.dir_mode == DirMode::Fixed,
+            dir_path: &self.config.default_dir,
+            save_on_exit: self.config.save_on_exit,
+            colors: self
+                .spec
+                .colors
+                .zip(self.color_choice())
+                .map(|(m, [t, b, r])| {
+                    let show =
+                        |(h, l): (u8, u8)| (h, l * m.lum_step, rgb((m.rgb)(h, l)), (m.label)(h, l));
+                    prefs::ColorView {
+                        text: show(t),
+                        background: show(b),
+                        border: show(r),
+                        lums: m.lums > 1,
+                    }
+                }),
+        }
+    }
+
+    /// The selected option of a choice field and how many options it has.
+    fn choice_state(&self, f: Field) -> Option<(usize, usize)> {
+        Some(match f {
+            Field::Wrap => (usize::from(self.config.wrap == WrapMode::Window), 2),
+            Field::Charset => (
+                self.spec.machine.charset(),
+                self.spec.machine.charsets().len(),
+            ),
+            Field::ControlAlt => (usize::from(self.config.control_key.alt), 2),
+            Field::ControlSide => (usize::from(self.config.control_key.right), 2),
+            Field::DirMode => (usize::from(self.config.dir_mode == DirMode::Fixed), 2),
+            _ => return None,
+        })
+    }
+
+    /// Change a setting from the Preferences page.
+    fn prefs_apply(&mut self, f: Field, op: Op) {
+        match (f, op) {
+            (Field::Wrap, Op::Choose(i)) => self.set_wrap(i == 0),
+            (Field::Zoom, Op::Dec) => self.set_scale(self.config.scale as i32 - 1),
+            (Field::Zoom, Op::Inc) => self.set_scale(self.config.scale as i32 + 1),
+            (Field::Charset, Op::Choose(i)) => self.set_charset(i),
+            (Field::ControlAlt, Op::Choose(i)) => self.config.control_key.alt = i == 1,
+            (Field::ControlSide, Op::Choose(i)) => self.config.control_key.right = i == 1,
+            (Field::CommodoreAlt, Op::Choose(i)) => self.config.commodore_key.alt = i == 1,
+            (Field::CommodoreSide, Op::Choose(i)) => self.config.commodore_key.right = i == 1,
+            (Field::LineNumbers, Op::Toggle) => {
+                self.config.line_numbers = !self.config.line_numbers
+            }
+            (Field::WarnOn, Op::Toggle) => {
+                self.config.line_warning_on = !self.config.line_warning_on
+            }
+            (Field::WarnCol, Op::Dec | Op::Inc) => {
+                let d: isize = if op == Op::Inc { 1 } else { -1 };
+                self.config.line_warning = (self.config.line_warning as isize + d)
+                    .clamp(1, config::MAX_LINE_WARNING as isize)
+                    as usize;
+            }
+            (Field::DirMode, Op::Choose(i)) => {
+                self.config.dir_mode = if i == 0 {
+                    DirMode::Last
+                } else {
+                    DirMode::Fixed
+                }
+            }
+            (
+                Field::FgHue
+                | Field::FgLum
+                | Field::BgHue
+                | Field::BgLum
+                | Field::BrdHue
+                | Field::BrdLum,
+                Op::Dec | Op::Inc,
+            ) => self.step_color(f, op == Op::Inc),
+            (Field::ResetColors, Op::Press) => {
+                self.config.text_color = None;
+                self.config.background_color = None;
+                self.config.border_color = None;
+            }
+            (Field::Defaults, Op::Press) => self.reset_prefs(),
+            (Field::Browse, Op::Press) => self.start_file_job(FileJobKind::Folder),
+            (Field::SaveOnExit, Op::Toggle) => self.config.save_on_exit = !self.config.save_on_exit,
+            (Field::SaveNow, Op::Press) => self.save_prefs(),
+            (Field::Close, Op::Press) => self.close_prefs(),
+            _ => {}
+        }
+    }
+
+    /// Put every setting on the Preferences page back to its default.
+    /// Settings the page doesn't show (the last folder used, the print
+    /// settings) are kept.
+    fn reset_prefs(&mut self) {
+        let d = Config {
+            last_dir: std::mem::take(&mut self.config.last_dir),
+            fonts: std::mem::take(&mut self.config.fonts),
+            print_paper: self.config.print_paper,
+            print_fill: self.config.print_fill,
+            print_size: self.config.print_size,
+            print_header: self.config.print_header,
+            print_line_numbers: self.config.print_line_numbers,
+            ..Config::default()
+        };
+        self.config = d;
+        self.set_wrap(self.config.wrap == WrapMode::Native);
+        self.set_charset(self.config.charset);
+        self.message = Some("Preferences set to defaults".into());
+    }
+
+    /// Step a hue (wrapping round) or luminance (stopping at the ends).
+    fn step_color(&mut self, f: Field, up: bool) {
+        let (Some(m), Some(colors)) = (self.spec.colors, self.color_choice()) else {
+            return;
+        };
+        let which = match f {
+            Field::FgHue | Field::FgLum => 0,
+            Field::BgHue | Field::BgLum => 1,
+            _ => 2,
+        };
+        let (mut h, mut l) = colors[which];
+        if matches!(f, Field::FgHue | Field::BgHue | Field::BrdHue) {
+            h = if up {
+                (h + 1) % m.hues
+            } else {
+                (h + m.hues - 1) % m.hues
+            };
+        } else {
+            l = if up {
+                (l + 1).min(m.lums - 1)
+            } else {
+                l.saturating_sub(1)
+            };
+        }
+        let slot = match which {
+            0 => &mut self.config.text_color,
+            1 => &mut self.config.background_color,
+            _ => &mut self.config.border_color,
+        };
+        *slot = Some((h, l));
+    }
+
+    /// A key pressed while Preferences is open. Returns true if the key was
+    /// used up (so the text it types should be ignored).
+    fn prefs_key(&mut self, k: Keycode, shift: bool) -> bool {
+        let Some(p) = &mut self.prefs else {
+            return false;
+        };
+        let f = p.focused();
+        let text_field = matches!(f, Field::DirPath | Field::WarnCol);
+        match k {
+            Keycode::TAB => p.move_focus(if shift { -1 } else { 1 }),
+            Keycode::UP => p.move_focus(-1),
+            Keycode::DOWN => p.move_focus(1),
+            Keycode::ESCAPE => self.close_prefs(),
+            Keycode::RETURN | Keycode::KP_ENTER => match f {
+                Field::Browse
+                | Field::ResetColors
+                | Field::Defaults
+                | Field::SaveNow
+                | Field::Close => self.prefs_apply(f, Op::Press),
+                _ => self.close_prefs(),
+            },
+            Keycode::LEFT | Keycode::RIGHT => {
+                let fwd = k == Keycode::RIGHT;
+                if let Some((cur, n)) = self.choice_state(f) {
+                    let next = if fwd {
+                        (cur + 1) % n
+                    } else {
+                        (cur + n - 1) % n
+                    };
+                    self.prefs_apply(f, Op::Choose(next));
+                } else if matches!(
+                    f,
+                    Field::Zoom
+                        | Field::WarnCol
+                        | Field::FgHue
+                        | Field::FgLum
+                        | Field::BgHue
+                        | Field::BgLum
+                        | Field::BrdHue
+                        | Field::BrdLum
+                ) {
+                    self.prefs_apply(f, if fwd { Op::Inc } else { Op::Dec });
+                }
+            }
+            Keycode::SPACE if !text_field => {
+                if let Some((cur, n)) = self.choice_state(f) {
+                    self.prefs_apply(f, Op::Choose((cur + 1) % n));
+                } else {
+                    self.prefs_apply(f, Op::Toggle);
+                    self.prefs_apply(f, Op::Press);
+                }
+            }
+            Keycode::BACKSPACE => match f {
+                Field::DirPath => {
+                    self.config.default_dir.pop();
+                }
+                Field::WarnCol => self.config.line_warning /= 10,
+                _ => {}
+            },
+            _ => return !text_field,
+        }
+        true
+    }
+
+    /// Text typed while Preferences is open (folder path, column number).
+    fn prefs_text(&mut self, text: &str) {
+        let Some(p) = &self.prefs else { return };
+        match p.focused() {
+            Field::DirPath => {
+                self.config.default_dir.push_str(text);
+                self.config.dir_mode = DirMode::Fixed;
+            }
+            Field::WarnCol => {
+                for d in text.chars().filter_map(|c| c.to_digit(10)) {
+                    let n = self.config.line_warning * 10 + d as usize;
+                    if n <= config::MAX_LINE_WARNING {
+                        self.config.line_warning = n;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ----- commands ------------------------------------------------------------
+
+    pub fn item_state(&self, c: Command, clipboard: &ClipboardUtil) -> ItemState {
+        use Command::*;
+        let enabled = match c {
+            Undo => self.editor.can_undo(),
+            Redo => self.editor.can_redo(),
+            Cut | Copy => self.editor.has_selection(),
+            Paste => clipboard.has_clipboard_text(),
+            // Only without unsaved changes, which reopening would lose.
+            ReopenAs => self.source.is_some() && !self.editor.doc.is_modified(),
+            RecentFiles => !self.config.recent.is_empty(),
+            _ => true,
+        };
+        let checked = match c {
+            ToggleWrap => Some(self.config.wrap == WrapMode::Native),
+            ToggleLineNumbers => Some(self.config.line_numbers),
+            ToggleShowCodes => Some(self.config.show_codes),
+            ToggleActOnCodes => Some(self.config.act_on_codes),
+            ToggleControlAlt => Some(self.config.control_key.alt),
+            ToggleControlSide => Some(self.config.control_key.right),
+            ToggleCharset => Some(self.spec.machine.charset() != 0),
+            _ => None,
+        };
+        ItemState { enabled, checked }
+    }
+
+    pub fn command(&mut self, c: Command, ctx: &Ctx) {
+        use Command::*;
+        if !self.item_state(c, ctx.clipboard).enabled {
+            return;
+        }
+        let layout = &ctx.frame.layout;
+        if self.dialog.is_some()
+            || self.file_job.is_some()
+            || self.prefs.is_some()
+            || self.print.is_some()
+            || self.fonts.is_some()
+            || self.image_page.is_some()
+        {
+            return;
+        }
+        match c {
+            New => self.guard(After::New),
+            Open => self.guard(After::Open),
+            OpenFromImage => self.guard(After::OpenFromImage),
+            SaveToImage => self.open_image_page(image_page::Mode::Save),
+            Import => self.guard(After::Import),
+            ReopenAs => self.reopen_as(),
+            Save => self.save(None),
+            SaveAs => self.start_file_job(FileJobKind::SaveAs { then: None }),
+            SaveListingAs => self.start_file_job(FileJobKind::SaveListingAs),
+            Export => self.dialog = Some(Dialog::export(&self.file_name())),
+            Print => self.open_print(),
+            Fonts => self.open_fonts(),
+            Find => self.open_find(false),
+            Replace => self.open_find(true),
+            FindNext => self.find_next(true, layout),
+            FindPrevious => self.find_next(false, layout),
+            GoToLine => self.open_goto(),
+            OpenRecent(n) => self.open_recent(n as usize),
+            RecentFiles => {}
+            Quit => self.guard(After::Quit),
+            Undo => {
+                self.editor.undo(layout);
+            }
+            Redo => {
+                self.editor.redo(layout);
+            }
+            Cut | Copy => {
+                let text = self.copy_text();
+                if c == Cut {
+                    self.editor.cut(layout);
+                }
+                if let Some(lines) = text {
+                    let s = clipboard::to_text(&lines, self.spec.machine.as_ref());
+                    if let Err(e) = ctx.clipboard.set_clipboard_text(&s) {
+                        self.message = Some(format!("Clipboard error: {e}"));
+                    }
+                }
+            }
+            Paste => match ctx.clipboard.clipboard_text() {
+                Ok(s) => {
+                    let (lines, skipped) = clipboard::from_text(&s, self.spec.machine.as_ref());
+                    let lines = self.keep_look_after(lines);
+                    self.editor.paste(&lines, layout);
+                    self.message = (skipped > 0).then(|| {
+                        format!(
+                            "{skipped} character(s) have no {} equivalent and were left out",
+                            self.spec.machine.name()
+                        )
+                    });
+                }
+                Err(e) => self.message = Some(format!("Clipboard error: {e}")),
+            },
+            SelectAll => self.editor.select_all(),
+            ToggleWrap => self.set_wrap(self.config.wrap != WrapMode::Native),
+            ToggleLineNumbers => {
+                self.config.line_numbers = !self.config.line_numbers;
+                self.message = Some(
+                    if self.config.line_numbers {
+                        "Line numbers shown"
+                    } else {
+                        "Line numbers hidden"
+                    }
+                    .into(),
+                );
+            }
+            ToggleShowCodes => {
+                self.config.show_codes = !self.config.show_codes;
+                self.message = Some(
+                    if self.config.show_codes {
+                        "Colour and reverse codes shown"
+                    } else {
+                        "Colour and reverse codes hidden (except in quotes)"
+                    }
+                    .into(),
+                );
+            }
+            ToggleActOnCodes => {
+                self.config.act_on_codes = !self.config.act_on_codes;
+                self.message = Some(
+                    if self.config.act_on_codes {
+                        "Colour and reverse codes act on the text"
+                    } else {
+                        "Colour and reverse codes only shown"
+                    }
+                    .into(),
+                );
+            }
+            ZoomIn => self.set_scale(self.config.scale as i32 + 1),
+            ZoomOut => self.set_scale(self.config.scale as i32 - 1),
+            ToggleControlAlt | ToggleControlSide => {
+                let k = &mut self.config.control_key;
+                if c == ToggleControlAlt {
+                    k.alt = !k.alt;
+                } else {
+                    k.right = !k.right;
+                }
+                self.message = Some(format!("CTRL key: {}", self.config.control_key.label()));
+            }
+            ToggleCharset => {
+                self.set_charset(self.spec.machine.charset() + 1);
+                let m = &self.spec.machine;
+                self.message = Some(format!("{} character set", m.charsets()[m.charset()]));
+            }
+            Preferences => self.open_prefs(Field::Wrap),
+            KeyHelp => {
+                self.overlay = Overlay::Help;
+                self.overlay_top = 0;
+            }
+            FileTypes => {
+                self.overlay = Overlay::FileTypes;
+                self.overlay_top = 0;
+            }
+            Licensing => {
+                self.overlay = Overlay::Licensing;
+                self.overlay_top = 0;
+            }
+            About => self.show_about(),
+        }
+    }
+
+    // ----- menus -------------------------------------------------------------
+
+    pub fn open_menu(&mut self, i: usize) {
+        if i < self.menus.len() {
+            self.menu.open = Some(i);
+            self.menu.hover = menu::step(&self.menus[i].items, None, 1);
+        }
+    }
+
+    fn close_menu(&mut self) {
+        self.menu = MenuState::default();
+    }
+
+    /// The menu currently showing its items (menu-bar or right-click).
+    fn open_items(&self) -> Option<&Menu> {
+        match (self.menu.open, self.menu.context) {
+            (Some(i), _) => Some(&self.menus[i]),
+            (None, Some(_)) => Some(&self.context_menu),
+            (None, None) => None,
+        }
+    }
+
+    /// The command of item `i` in the open menu.
+    fn open_command(&self, i: usize) -> Option<Command> {
+        self.open_items()?.items.get(i)?.command
+    }
+
+    /// The items of the hovered item's submenu, if it has one.
+    fn hover_submenu(&self) -> Option<&[menu::Item]> {
+        let it = self.open_items()?.items.get(self.menu.hover?)?;
+        (!it.submenu.is_empty()).then_some(&it.submenu[..])
+    }
+
+    /// The submenu's highlighted item is in use (keys go to it).
+    fn in_submenu(&self) -> bool {
+        self.menu.sub_open && self.menu.sub_hover.is_some()
+    }
+
+    /// Open the hovered item's submenu, highlighting its first item if
+    /// `select`.
+    fn open_submenu(&mut self, select: bool) {
+        if let Some(sub) = self.hover_submenu() {
+            let first = menu::step(sub, None, 1);
+            self.menu.sub_open = true;
+            if select {
+                self.menu.sub_hover = first;
+            }
+        }
+    }
+
+    /// Choose `c` from a menu, if it's enabled: close the menus and do it
+    /// (a submenu item opens its submenu instead).
+    fn choose(&mut self, c: Command, ctx: &Ctx) {
+        if !self.item_state(c, ctx.clipboard).enabled {
+            return;
+        }
+        if c == Command::RecentFiles {
+            self.open_submenu(true);
+            return;
+        }
+        self.close_menu();
+        self.command(c, ctx);
+    }
+
+    fn menu_key(&mut self, k: Keycode, ctx: &Ctx) {
+        let n = self.menus.len();
+        match k {
+            Keycode::ESCAPE | Keycode::F10 => self.close_menu(),
+            // Into and out of a submenu.
+            Keycode::RIGHT if !self.in_submenu() && self.hover_submenu().is_some() => {
+                self.open_submenu(true);
+            }
+            Keycode::LEFT if self.in_submenu() => {
+                self.menu.sub_open = false;
+                self.menu.sub_hover = None;
+            }
+            Keycode::LEFT | Keycode::RIGHT => {
+                if let Some(open) = self.menu.open {
+                    let next = if k == Keycode::LEFT {
+                        open + n - 1
+                    } else {
+                        open + 1
+                    };
+                    self.open_menu(next % n);
+                }
+            }
+            Keycode::UP | Keycode::DOWN => {
+                let dir = if k == Keycode::UP { -1 } else { 1 };
+                if self.in_submenu() {
+                    if let Some(sub) = self.hover_submenu() {
+                        self.menu.sub_hover = menu::step(sub, self.menu.sub_hover, dir);
+                    }
+                } else if let Some(m) = self.open_items() {
+                    self.menu.hover = menu::step(&m.items, self.menu.hover, dir);
+                    self.menu.sub_open = false;
+                    self.menu.sub_hover = None;
+                }
+            }
+            Keycode::RETURN | Keycode::KP_ENTER | Keycode::SPACE => {
+                let cmd = if self.in_submenu() {
+                    self.hover_submenu()
+                        .and_then(|s| s.get(self.menu.sub_hover?)?.command)
+                } else {
+                    self.menu.hover.and_then(|h| self.open_command(h))
+                };
+                match cmd {
+                    Some(c) => self.choose(c, ctx),
+                    None => self.close_menu(),
+                }
+            }
+            other => {
+                // The item's underlined hot key chooses it (in the
+                // submenu, if one is in use).
+                let key = char::from_u32(other.into_i32() as u32).map(|c| c.to_ascii_lowercase());
+                let items = if self.in_submenu() {
+                    self.hover_submenu()
+                } else {
+                    self.open_items().map(|m| &m.items[..])
+                };
+                let found = items.and_then(|items| {
+                    items
+                        .iter()
+                        .position(|it| it.command.is_some() && menu::hot_key(&it.label) == key)
+                        .map(|i| (i, items[i].command.unwrap()))
+                });
+                if let Some((i, c)) = found {
+                    if c == Command::RecentFiles {
+                        self.menu.hover = Some(i);
+                    }
+                    self.choose(c, ctx);
+                }
+            }
+        }
+    }
+
+    // ----- keyboard ------------------------------------------------------------
+
+    fn machine_ctrl_mod(&self) -> Mod {
+        modifier(self.config.control_key)
+    }
+
+    /// The PC modifier used as the Commodore (C=) key.
+    fn commodore_mod(&self) -> Mod {
+        modifier(self.config.commodore_key)
+    }
+
+    /// The modifier for the editor's shortcuts: Command on macOS; elsewhere
+    /// Ctrl, the left one unless that's the CTRL key.
+    fn shortcut_mod(&self) -> Mod {
+        if cfg!(target_os = "macos") {
+            Mod::LGUIMOD | Mod::RGUIMOD
+        } else if self.config.control_key
+            == (ControlKey {
+                alt: false,
+                right: false,
+            })
+        {
+            Mod::RCTRLMOD
+        } else {
+            Mod::LCTRLMOD
+        }
+    }
+
+    /// Typed text (from the OS keyboard layout). Returns true if it
+    /// typed anything (and so should click).
+    pub fn text_input(&mut self, text: &str, held: Mod, layout: &Layout) -> bool {
+        if std::mem::take(&mut self.swallow_text)
+            || self.menu.is_open()
+            || self.dialog.is_some()
+            || self.file_job.is_some()
+        {
+            return false;
+        }
+        if self.prefs.is_some() {
+            self.prefs_text(text);
+            return false;
+        }
+        if self.image_page.is_some() {
+            let codes: Vec<u8> = text
+                .chars()
+                .filter_map(|c| self.spec.machine.code_for_char(c))
+                .collect();
+            if let Some(p) = &mut self.image_page {
+                p.type_codes(&codes);
+            }
+            return false;
+        }
+        if self.print.is_some() || self.fonts.is_some() {
+            return false;
+        }
+        // The Find panel: text goes to an Atari field the normal way.
+        if let Some(p) = self.active_find() {
+            match p.focused() {
+                find_page::Field::LineText => {
+                    self.line_text_input(text);
+                    return false;
+                }
+                f if !f.is_atari() => return false,
+                _ => {}
+            }
+        }
+        let ctrl_held =
+            held.intersects(self.shortcut_mod() | self.machine_ctrl_mod() | self.commodore_mod());
+        let mut typed = false;
+        if self.overlay == Overlay::None && !ctrl_held {
+            for c in text.chars() {
+                typed |= self.machine_key(KeyInput::plain(Key::Char(c)), layout);
+            }
+        }
+        typed
+    }
+
+    /// Send a key to the machine's keyboard rules and apply the result.
+    /// Returns false if the key means nothing to the machine.
+    fn machine_key(&mut self, input: KeyInput, layout: &Layout) -> bool {
+        let action = self.spec.keyboard.handle(input);
+        // Typing in a Find panel field: the one-line editing keys only.
+        let field_layout = self.field_layout();
+        let machine = self.spec.machine.as_ref();
+        if let Some(p) = self.find.as_ref().filter(|p| p.active)
+            && p.focused().is_atari()
+        {
+            use EditAction as A;
+            let field = if p.focused() == find_page::Field::FindText {
+                &mut self.find_field
+            } else {
+                &mut self.replace_field
+            };
+            let one_line = matches!(
+                action,
+                A::Insert(_)
+                    | A::Backspace
+                    | A::DeleteForward
+                    | A::InsertSpace
+                    | A::DeleteLine
+                    | A::MoveLeft
+                    | A::MoveRight
+                    | A::LineStart
+                    | A::LineEnd
+                    | A::ToggleOverwrite
+                    | A::ToggleInverse
+                    | A::EscapePending
+            );
+            if one_line {
+                field.apply(action, &field_layout, machine, input.mods.shift);
+                if let Some(note) = field.take_note() {
+                    self.message = Some(note);
+                }
+            }
+            return one_line;
+        }
+        if action != EditAction::None {
+            self.message = None;
+        }
+        self.editor
+            .apply(action, layout, self.spec.machine.as_ref(), input.mods.shift);
+        if let Some(note) = self.editor.take_note() {
+            self.message = Some(note);
+        }
+        action != EditAction::None
+    }
+
+    /// Handle a key press.
+    /// Returns true if it should click.
+    pub fn key_down(&mut self, k: Keycode, m: Mod, ctx: &Ctx) -> bool {
+        self.swallow_text = false;
+        // The number pad is a second set of cursor keys when NumLock is off,
+        // or when Shift is held with NumLock on (the standard PC rule). In
+        // the second case Shift is used up by the switch, so it moves the
+        // cursor without selecting, and the digit the OS types is dropped.
+        let shift_mods = Mod::LSHIFTMOD | Mod::RSHIFTMOD;
+        let (k, m) = match numpad_navigation(k) {
+            Some(nav) if !m.contains(Mod::NUMMOD) => (nav, m),
+            Some(nav) if m.intersects(shift_mods) => {
+                self.swallow_text = true;
+                (nav, m & !shift_mods)
+            }
+            _ => (k, m),
+        };
+        let machine_ctrl = m.intersects(self.machine_ctrl_mod());
+        // The CTRL key wins if both are set to the same PC key.
+        let commodore = m.intersects(self.commodore_mod()) && !machine_ctrl;
+        let editor_ctrl = m.intersects(self.shortcut_mod()) && !machine_ctrl && !commodore;
+        let shift = m.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
+        let alt = m.intersects(Mod::LALTMOD | Mod::RALTMOD) && !machine_ctrl && !commodore;
+        let layout = &ctx.frame.layout;
+
+        if self.file_job.is_some() {
+            return false;
+        }
+        if let Some(d) = &mut self.dialog {
+            let n = d.buttons.len();
+            match k {
+                Keycode::LEFT | Keycode::UP => d.focus = (d.focus + n - 1) % n,
+                Keycode::TAB if shift => d.focus = (d.focus + n - 1) % n,
+                Keycode::RIGHT | Keycode::DOWN | Keycode::TAB => d.focus = (d.focus + 1) % n,
+                Keycode::RETURN | Keycode::KP_ENTER | Keycode::SPACE => {
+                    let f = d.focus;
+                    self.dialog_choose(f);
+                }
+                Keycode::ESCAPE => {
+                    let c = d.cancel;
+                    self.dialog_choose(c);
+                }
+                _ => {}
+            }
+            self.swallow_text = true;
+            return false;
+        }
+        if self.menu.is_open() {
+            self.menu_key(k, ctx);
+            self.swallow_text = true;
+            return false;
+        }
+
+        if self.prefs.is_some() {
+            self.swallow_text = self.prefs_key(k, shift);
+            return false;
+        }
+        if self.print.is_some() {
+            self.print_key(k, shift);
+            self.swallow_text = true;
+            return false;
+        }
+        if self.fonts.is_some() {
+            self.fonts_key(k, shift);
+            self.swallow_text = true;
+            return false;
+        }
+        if let Some(p) = &mut self.image_page {
+            let action = p.key(k, shift);
+            // Typing goes on into the File name box.
+            self.swallow_text = !p.wants_text();
+            self.image_action(action);
+            return false;
+        }
+        // The Find panel takes its own keys; the rest go to its Atari
+        // field (if one has the focus) as if typed in the text. The
+        // editor's shortcuts still work, Ctrl+A/C/X/V acting on the field.
+        if let Some(p) = self.active_find() {
+            let in_field = p.focused().is_atari();
+            if in_field
+                && !machine_ctrl
+                && let Some(action) = word_key(k, editor_ctrl, m)
+            {
+                let field_layout = self.field_layout();
+                let machine = self.spec.machine.as_ref();
+                if let Some(e) = match self.find.as_ref().map(|p| p.focused()) {
+                    Some(find_page::Field::FindText) => Some(&mut self.find_field),
+                    Some(find_page::Field::ReplaceText) => Some(&mut self.replace_field),
+                    _ => None,
+                } {
+                    e.apply(action, &field_layout, machine, shift);
+                }
+                self.swallow_text = true;
+                return false;
+            }
+            if editor_ctrl {
+                if in_field && matches!(k, Keycode::A | Keycode::C | Keycode::X | Keycode::V) {
+                    self.field_clipboard(k, ctx.clipboard);
+                    self.swallow_text = true;
+                    return false;
+                }
+            } else if self.find_key(k, shift, layout) {
+                self.swallow_text = true;
+                return false;
+            } else if !in_field {
+                return false;
+            }
+        }
+
+        if self.overlay != Overlay::None {
+            match k {
+                Keycode::ESCAPE | Keycode::F1 | Keycode::RETURN => self.overlay = Overlay::None,
+                Keycode::UP => self.overlay_top = self.overlay_top.saturating_sub(1),
+                Keycode::DOWN => self.overlay_top += 1,
+                Keycode::PAGEUP => self.overlay_top = self.overlay_top.saturating_sub(20),
+                Keycode::PAGEDOWN => self.overlay_top += 20,
+                _ => {}
+            }
+            return false;
+        }
+
+        // Alt+letter opens a menu (unless Alt is the Atari CONTROL key).
+        if alt {
+            let c = char::from_u32(k.into_i32() as u32).unwrap_or('\0');
+            if let Some(i) = self
+                .menus
+                .iter()
+                .position(|m| menu::hot_key(m.title) == Some(c))
+            {
+                self.open_menu(i);
+                self.swallow_text = true;
+            }
+            return false;
+        }
+
+        // Moving by words (Ctrl+arrows; Option+arrows on a Mac).
+        if !machine_ctrl
+            && !commodore
+            && let Some(action) = word_key(k, editor_ctrl, m)
+        {
+            self.editor
+                .apply(action, layout, self.spec.machine.as_ref(), shift);
+            return false;
+        }
+
+        // Editor commands (left Ctrl and function keys) never click.
+        let mac = cfg!(target_os = "macos");
+        let option = m.intersects(Mod::LALTMOD | Mod::RALTMOD);
+        if editor_ctrl {
+            use Command::*;
+            let cmd = match k {
+                Keycode::N => Some(New),
+                Keycode::O => Some(Open),
+                // Find: Ctrl+F, Ctrl+H, Ctrl+G; on a Mac ⌘F, ⌥⌘F, ⌘G
+                // (find next), ⇧⌘G, ⌘L.
+                Keycode::F if mac && option => Some(Replace),
+                Keycode::F => Some(Find),
+                Keycode::H if !mac => Some(Replace),
+                Keycode::G if mac && shift => Some(FindPrevious),
+                Keycode::G if mac => Some(FindNext),
+                Keycode::G => Some(GoToLine),
+                Keycode::L if mac => Some(GoToLine),
+                Keycode::P => Some(Print),
+                Keycode::S if shift => Some(SaveAs),
+                Keycode::S => Some(Save),
+                Keycode::Q => Some(Quit),
+                Keycode::Z if shift => Some(Redo),
+                Keycode::Z => Some(Undo),
+                Keycode::Y => Some(Redo),
+                Keycode::X => Some(Cut),
+                Keycode::C => Some(Copy),
+                Keycode::V => Some(Paste),
+                Keycode::A => Some(SelectAll),
+                Keycode::COMMA => Some(Preferences),
+                Keycode::EQUALS | Keycode::PLUS | Keycode::KP_PLUS => Some(ZoomIn),
+                Keycode::MINUS | Keycode::KP_MINUS => Some(ZoomOut),
+                Keycode::HOME | Keycode::END => {
+                    let a = if k == Keycode::HOME {
+                        EditAction::DocStart
+                    } else {
+                        EditAction::DocEnd
+                    };
+                    self.editor
+                        .apply(a, layout, self.spec.machine.as_ref(), shift);
+                    None
+                }
+                // The Mac's ⌘-arrows: start and end of the line or document.
+                Keycode::UP | Keycode::DOWN | Keycode::LEFT | Keycode::RIGHT
+                    if cfg!(target_os = "macos") =>
+                {
+                    let a = match k {
+                        Keycode::UP => EditAction::DocStart,
+                        Keycode::DOWN => EditAction::DocEnd,
+                        Keycode::LEFT => EditAction::LineStart,
+                        _ => EditAction::LineEnd,
+                    };
+                    self.editor
+                        .apply(a, layout, self.spec.machine.as_ref(), shift);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(c) = cmd {
+                self.command(c, ctx);
+            }
+            return false;
+        }
+
+        // F3 / Shift+F3: Find Next / Previous.
+        if k == Keycode::F3 && !alt && !machine_ctrl {
+            let c = if shift {
+                Command::FindPrevious
+            } else {
+                Command::FindNext
+            };
+            self.command(c, ctx);
+            return false;
+        }
+        // Function keys only act on their own: Shift+F4 is not F4.
+        let plain = !shift && !alt && !machine_ctrl && !commodore;
+        let fkey = match k {
+            _ if !plain => None,
+            Keycode::F1 => Some(Command::KeyHelp),
+            Keycode::F2 => Some(Command::Save),
+            Keycode::F4 => Some(Command::ToggleWrap),
+            Keycode::F7 => Some(Command::ToggleCharset),
+            Keycode::F5 => Some(Command::ToggleShowCodes),
+            Keycode::F6 => Some(Command::ToggleActOnCodes),
+            Keycode::F9 => {
+                self.open_prefs(Field::WarnOn);
+                return false;
+            }
+            _ => None,
+        };
+        if let Some(c) = fkey {
+            self.command(c, ctx);
+            return false;
+        }
+        if k == Keycode::F10 && plain {
+            self.open_menu(0);
+            return false;
+        }
+
+        let mods = Mods {
+            shift,
+            control: machine_ctrl,
+            commodore,
+        };
+        let key = match k {
+            Keycode::UP => Key::Up,
+            Keycode::DOWN => Key::Down,
+            Keycode::LEFT => Key::Left,
+            Keycode::RIGHT => Key::Right,
+            Keycode::HOME => Key::Home,
+            Keycode::END => Key::End,
+            Keycode::PAGEUP => Key::PageUp,
+            Keycode::PAGEDOWN => Key::PageDown,
+            Keycode::RETURN | Keycode::KP_ENTER => Key::Enter,
+            Keycode::BACKSPACE => Key::Backspace,
+            Keycode::DELETE => Key::Delete,
+            Keycode::INSERT => Key::Insert,
+            Keycode::TAB => Key::Tab,
+            Keycode::ESCAPE => Key::Escape,
+            Keycode::F1 => Key::Function(1),
+            Keycode::F2 => Key::Function(2),
+            Keycode::F3 => Key::Function(3),
+            Keycode::F4 => Key::Function(4),
+            Keycode::F5 => Key::Function(5),
+            Keycode::F6 => Key::Function(6),
+            Keycode::F7 => Key::Function(7),
+            Keycode::F8 => Key::Function(8),
+            other => {
+                let code = other.into_i32();
+                let printable = (0x20..0x7F).contains(&code);
+                if machine_ctrl && printable {
+                    Key::Control(char::from(code as u8))
+                } else if commodore && printable {
+                    Key::Commodore(char::from(code as u8))
+                } else {
+                    // Printable keys arrive as TextInput, which decides
+                    // whether to click; other keys (F-keys with Shift, etc.)
+                    // do nothing.
+                    return false;
+                }
+            }
+        };
+        self.machine_key(KeyInput { key, mods }, layout)
+    }
+
+    // ----- mouse -------------------------------------------------------------
+
+    /// Document position under pixel (x, y), clamped into the text area.
+    fn pos_at(&self, x: i32, y: i32, f: &Frame) -> Pos {
+        let cell = f.cell as i32;
+        let col = (x - f.origin_x).div_euclid(cell) - f.layout.left_margin as i32;
+        let row = (y - f.text_top).div_euclid(cell);
+        let abs = (self.editor.top as i32 + row).max(0) as usize;
+        f.layout
+            .position_at(&self.editor.doc, abs, col.max(0) as usize)
+    }
+
+    pub fn mouse_down(&mut self, x: i32, y: i32, shift: bool, clicks: u8, f: &Frame) {
+        if self.file_job.is_some() {
+            return;
+        }
+        if let Some(d) = &self.dialog {
+            if let Some(b) = d.button_at(x, y) {
+                self.dialog_choose(b);
+            }
+            return;
+        }
+        if let Some(i) = self.geom.title_at(x, y) {
+            if self.menu.open == Some(i) {
+                self.close_menu();
+            } else {
+                self.menu = MenuState {
+                    open: Some(i),
+                    ..Default::default()
+                };
+            }
+            return;
+        }
+        if self.menu.is_open() {
+            if !self.geom.in_dropdown(x, y) && !self.geom.in_sub_dropdown(x, y) {
+                self.close_menu();
+            }
+            return;
+        }
+        if let Some(p) = &mut self.prefs {
+            if let Some((f, op)) = p.hit(x, y) {
+                p.focus_on(f);
+                self.prefs_apply(f, op);
+            }
+            return;
+        }
+        if let Some(p) = &mut self.print {
+            if let Some((f, op)) = p.hit(x, y) {
+                p.focus_on(f);
+                self.print_apply(f, op);
+            }
+            return;
+        }
+        if let Some(p) = &mut self.fonts {
+            if let Some((field, _)) = p.hit(x, y) {
+                p.focus_on(field);
+                self.fonts_apply(field);
+            }
+            return;
+        }
+        if let Some(p) = &mut self.image_page {
+            let action = p.click(x, y, clicks >= 2);
+            self.image_action(action);
+            return;
+        }
+        // The Find panel stays open while clicking in the text.
+        if self.find_click(x, y, shift, f) {
+            return;
+        }
+        if self.overlay != Overlay::None {
+            return;
+        }
+        if y >= f.text_top && y < f.status_top {
+            let pos = self.pos_at(x, y, f);
+            self.editor.click(pos, shift);
+            if !shift {
+                self.editor.begin_drag();
+            }
+            self.dragging = true;
+        }
+    }
+
+    /// Right button: move the cursor there (unless clicking inside the
+    /// selection) and open the right-click menu.
+    pub fn mouse_right(&mut self, x: i32, y: i32, f: &Frame) {
+        self.close_menu();
+        if self.dialog.is_some() || self.file_job.is_some() {
+            return;
+        }
+        if self.overlay != Overlay::None
+            || self.prefs.is_some()
+            || self.print.is_some()
+            || self.fonts.is_some()
+            || self.image_page.is_some()
+            || y < f.text_top
+            || y >= f.status_top
+        {
+            return;
+        }
+        let pos = self.pos_at(x, y, f);
+        let in_selection = self
+            .editor
+            .selection()
+            .is_some_and(|(a, b)| pos >= a && pos <= b);
+        if !in_selection {
+            self.editor.click(pos, false);
+        }
+        self.menu.context = Some((x, y));
+    }
+
+    pub fn mouse_move(&mut self, x: i32, y: i32, left_held: bool, f: &Frame) {
+        if self.menu.is_open() {
+            if self.menu.open.is_some()
+                && let Some(i) = self.geom.title_at(x, y)
+                && self.menu.open != Some(i)
+            {
+                self.menu = MenuState {
+                    open: Some(i),
+                    ..Default::default()
+                };
+            } else if self.geom.in_sub_dropdown(x, y) {
+                self.menu.sub_hover = self.geom.sub_item_at(x, y);
+            } else if self.geom.in_dropdown(x, y) {
+                let hover = self.geom.item_at(x, y);
+                if hover != self.menu.hover {
+                    self.menu.hover = hover;
+                    self.menu.sub_open = false;
+                    self.menu.sub_hover = None;
+                    // Resting on an item with a submenu opens it (an empty
+                    // one, like Recent Files with none yet, doesn't).
+                    self.open_submenu(false);
+                }
+            }
+            return;
+        }
+        if self.dragging && left_held {
+            let pos = self.pos_at(x, y, f);
+            self.editor.click(pos, true);
+            self.editor.scroll_to_cursor(&f.layout);
+        }
+    }
+
+    pub fn mouse_up(&mut self, x: i32, y: i32, ctx: &Ctx) {
+        if std::mem::take(&mut self.dragging) && !self.editor.has_selection() {
+            // A click without a drag selects nothing.
+            self.editor.clear_selection();
+        }
+        if self.menu.is_open() && self.geom.in_sub_dropdown(x, y) {
+            let cmd = self.geom.sub_item_at(x, y).and_then(|i| {
+                self.hover_submenu()
+                    .and_then(|s| s.get(i))
+                    .and_then(|it| it.command)
+            });
+            if let Some(c) = cmd {
+                self.choose(c, ctx);
+            }
+        } else if self.menu.is_open() && self.geom.in_dropdown(x, y) {
+            let cmd = self.geom.item_at(x, y).and_then(|i| self.open_command(i));
+            if let Some(c) = cmd {
+                self.choose(c, ctx);
+            }
+        }
+    }
+
+    /// The mouse wheel, `dy` notches (up positive), the pointer at `at`.
+    pub fn wheel(&mut self, dy: i32, (x, y): (i32, i32), f: &Frame) {
+        if let Some(p) = &mut self.image_page {
+            p.wheel(x, y, dy);
+        } else if self.overlay == Overlay::None {
+            self.editor.scroll_by(-dy as isize * 3, &f.layout);
+        } else {
+            self.overlay_top = (self.overlay_top as isize - dy as isize * 3).max(0) as usize;
+        }
+    }
+
+    /// Test hook: select the first `n` lines.
+    pub fn test_select_lines(&mut self, n: usize) {
+        self.editor.click(Pos::default(), false);
+        self.editor.click(Pos { line: n, col: 0 }, true);
+    }
+
+    /// Test hook: select the first `n` characters backwards, leaving the
+    /// cursor on the first (selected) character.
+    pub fn test_select_back(&mut self, n: usize) {
+        self.editor.click(Pos { line: 0, col: n }, false);
+        self.editor.click(Pos::default(), true);
+    }
+}
+
+/// The navigation key a number-pad key gives with NumLock off.
+fn numpad_navigation(k: Keycode) -> Option<Keycode> {
+    Some(match k {
+        Keycode::KP_8 => Keycode::UP,
+        Keycode::KP_2 => Keycode::DOWN,
+        Keycode::KP_4 => Keycode::LEFT,
+        Keycode::KP_6 => Keycode::RIGHT,
+        Keycode::KP_7 => Keycode::HOME,
+        Keycode::KP_1 => Keycode::END,
+        Keycode::KP_9 => Keycode::PAGEUP,
+        Keycode::KP_3 => Keycode::PAGEDOWN,
+        Keycode::KP_0 => Keycode::INSERT,
+        Keycode::KP_PERIOD => Keycode::DELETE,
+        _ => return None,
+    })
+}
+
+/// Write to a temporary file next to `path`, then rename over it, so a
+/// failed write never leaves a half-written file.
+/// The word (or, with ⌘ on a Mac, line) movement for an arrow key with
+/// the editor's modifier: Ctrl+Left/Right by words on Windows and Linux;
+/// on a Mac Option+Left/Right by words and ⌘Left/Right to the line's ends.
+fn word_key(k: Keycode, editor_ctrl: bool, m: Mod) -> Option<EditAction> {
+    let left = match k {
+        Keycode::LEFT => true,
+        Keycode::RIGHT => false,
+        _ => return None,
+    };
+    let option = m.intersects(Mod::LALTMOD | Mod::RALTMOD);
+    if cfg!(target_os = "macos") {
+        if editor_ctrl {
+            Some(if left {
+                EditAction::LineStart
+            } else {
+                EditAction::LineEnd
+            })
+        } else if option {
+            Some(if left {
+                EditAction::WordLeft
+            } else {
+                EditAction::WordRight
+            })
+        } else {
+            None
+        }
+    } else if editor_ctrl {
+        Some(if left {
+            EditAction::WordLeft
+        } else {
+            EditAction::WordRight
+        })
+    } else {
+        None
+    }
+}
+
+/// The folder of Atari fonts that comes with the program, if there is
+/// one: `fonts/FNT` beside the program (the Windows and Linux packages),
+/// inside the Mac app (`Contents/Resources/FNT`), where the Linux
+/// installer puts them (`~/.local/share/<app>/fonts`), or, for a build
+/// run from the source (`target/debug` or `target/release`), the
+/// source's `assets/fonts/FNT`.
+fn bundled_fonts(app_id: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    [
+        Some(dir.join("fonts/FNT")),
+        Some(dir.join("../Resources/FNT")),
+        data.map(|d| d.join(app_id).join("fonts")),
+        Some(dir.join("../../assets/fonts/FNT")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|d| d.is_dir())
+    .map(|d| d.canonicalize().unwrap_or(d))
+}
+
+/// The user's home folder (`HOME`, or `USERPROFILE` on Windows).
+fn home_dir() -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .find(|d| d.is_dir())
+}
+
+/// Why a document couldn't be read or written.
+#[derive(Debug)]
+enum SourceError {
+    /// Reading or writing the file (or the image file) failed.
+    Io(std::io::Error),
+    /// The disk image refused: not an image, disk full, locked...
+    Disk(DiskError),
+}
+
+impl std::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceError::Io(e) => e.fmt(f),
+            SourceError::Disk(e) => e.fmt(f),
+        }
+    }
+}
+
+/// Where a document is, for messages: the file's path, or the image's
+/// path and the name in it.
+fn describe(source: &Source) -> String {
+    match source {
+        Source::File(p) => p.display().to_string(),
+        Source::Image { image, .. } => format!("{} > {}", image.display(), source.name()),
+    }
+}
+
+/// A file's name from its path, for messages.
+fn file_label(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// How long a flashing cursor stays on, then off.
+const CURSOR_FLASH_MS: u64 = 500;
+
+/// The longest Find or Replace text.
+const FIELD_MAX: usize = 120;
+
+/// A message as a sentence: capital first letter, full stop at the end.
+fn sentence(s: &str) -> String {
+    let mut c = s.chars();
+    let mut out: String = match c.next() {
+        Some(first) => first.to_uppercase().chain(c).collect(),
+        None => return String::new(),
+    };
+    if !out.ends_with(['.', '!', '?']) {
+        out.push('.');
+    }
+    out
+}
+
+/// Start another copy of this program on a file, in a window of its own.
+fn open_new_window(path: &Path) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(path);
+    // The test hooks are for this window only (a dropped-files hook would
+    // otherwise open windows without end).
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("RETRO_EDITOR_") {
+            cmd.env_remove(k);
+        }
+    }
+    let mut child = cmd.spawn()?;
+    // Collect it when it exits.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Open a file in the system's viewer for its type, without waiting.
+fn open_in_viewer(path: &Path) -> std::io::Result<()> {
+    let program = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut child = std::process::Command::new(program).arg(path).spawn()?;
+    // Collect the launcher when it exits.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp~");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// The SDL modifier for a PC key chosen as one of the machine's keys.
+fn modifier(key: ControlKey) -> Mod {
+    match (key.alt, key.right) {
+        (false, false) => Mod::LCTRLMOD,
+        (false, true) => Mod::RCTRLMOD,
+        (true, false) => Mod::LALTMOD,
+        (true, true) => Mod::RALTMOD,
+    }
+}

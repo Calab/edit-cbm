@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/retro-core",
+    "crates/cbm",
+    "crates/retro-sdl",
+    "apps/edit-cbm",
+    "tools/fontgen",
+]
+
+[workspace.package]
+authors = ["Steve Norton", "Claude AI"]
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Calab/edit-cbm"
+version = "0.1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

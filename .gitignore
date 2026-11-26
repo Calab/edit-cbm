@@ -1,0 +1,10 @@
+/target
+*.swp
+.DS_Store
+/out
+rust commands.txt
+notes.txt
+/tmp
+# Character ROMs copied from VICE for development only: never committed
+# or built into the program (see fonts-dev/README in the handoff notes).
+/fonts-dev

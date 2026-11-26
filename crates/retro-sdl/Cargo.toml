@@ -1,0 +1,12 @@
+[package]
+name = "retro-sdl"
+description = "SDL2 front end for Edit CBM (copied from Edit Atari; maintained separately)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+fontdue = "0.9.5"
+retro-core = { path = "../retro-core" }
+rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }
+sdl2 = { version = "0.39.0", features = ["bundled", "static-link"] }
