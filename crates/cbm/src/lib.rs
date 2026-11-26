@@ -14,12 +14,20 @@ pub use model::Model;
 
 use retro_core::FileFormat;
 
-use basic::{BASIC_1, BASIC_2, BASIC_4, C64_MEMORY, CbmBasic, PET_MEMORY, VIC20_MEMORY};
+use basic::{
+    BASIC_1, BASIC_2, BASIC_4, C64_MEMORY, CbmBasic, PET_MEMORY, SIMONS_BASIC, SIMONS_MEMORY,
+    VIC20_MEMORY,
+};
 
 /// Each model's file formats, most specific first; plain PETSCII text
 /// last. BASIC programs are saved at the model's usual load address
 /// unless the document came with its own.
+/// Simons' BASIC first: it claims only programs using its keywords.
 pub static C64_FORMATS: &[&dyn FileFormat] = &[
+    &CbmBasic {
+        dialect: &SIMONS_BASIC,
+        memory: &SIMONS_MEMORY,
+    },
     &CbmBasic {
         dialect: &BASIC_2,
         memory: &C64_MEMORY,

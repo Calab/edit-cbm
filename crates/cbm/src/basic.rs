@@ -24,6 +24,9 @@ pub struct Dialect {
     pub name: &'static str,
     pub status: &'static str,
     pub keywords: &'static [&'static str],
+    /// Simons' BASIC: its own keywords are made into `$64` tokens first
+    /// (see [`simons_pass`]), then BASIC 2's as usual.
+    pub simons: bool,
 }
 
 /// BASIC 2's keywords (C64 ROM `$A09E`).
@@ -134,21 +137,108 @@ const BASIC4: [&str; 91] = [
 /// The first PET's BASIC: BASIC 2's keywords without GO.
 pub static BASIC_1: Dialect = Dialect {
     name: "BASIC 1.0",
+    simons: false,
     status: "BASIC 1",
     keywords: BASIC2.split_at(75).0,
 };
 
 pub static BASIC_2: Dialect = Dialect {
     name: "BASIC 2.0",
+    simons: false,
     status: "BASIC 2",
     keywords: &BASIC2,
 };
 
 pub static BASIC_4: Dialect = Dialect {
     name: "BASIC 4.0",
+    simons: false,
     status: "BASIC 4",
     keywords: &BASIC4,
 };
+
+/// Simons' BASIC's keywords, from its cartridge ROM (`$A521`, each
+/// ending in `@`): token `$64` then the keyword's place + 1. `>>` marks
+/// numbers it leaves unused, those BASIC 2's CRUNCH would turn into
+/// something else (`"`, `?`, operators, `T`).
+const SIMONS: [&str; 127] = [
+    "HIRES", "PLOT", "LINE", "BLOCK", "FCHR", "FCOL", "FILL", "REC", "ROT", "DRAW", "CHAR",
+    "HI COL", "INV", "FRAC", "MOVE", "PLACE", "UPB", "UPW", "LEFTW", "LEFTB", "DOWNB", "DOWNW",
+    "RIGHTB", "RIGHTW", "MULTI", "COLOUR", "MMOB", "BFLASH", "MOB SET", "MUSIC", "FLASH", "REPEAT",
+    "PLAY", ">>", "CENTRE", "ENVELOPE", "CGOTO", "WAVE", "FETCH", "AT(", "UNTIL", ">>", ">>",
+    "USE", ">>", "GLOBAL", ">>", "RESET", "PROC", "CALL", "EXEC", "END PROC", "EXIT", "END LOOP",
+    "ON KEY", "DISABLE", "RESUME", "LOOP", "DELAY", ">>", ">>", ">>", ">>", "SECURE", "DISAPA",
+    "CIRCLE", "ON ERROR", "NO ERROR", "LOCAL", "RCOMP", "ELSE", "RETRACE", "TRACE", "DIR", "PAGE",
+    "DUMP", "FIND", "OPTION", "AUTO", "OLD", "JOY", "MOD", "DIV", ">>", "DUP", "INKEY", "INST",
+    "TEST", "LIN", "EXOR", "INSERT", "POT", "PENX", ">>", "PENY", "SOUND", "GRAPHICS", "DESIGN",
+    "RLOCMOB", "CMOB", "BCKGNDS", "PAUSE", "NRM", "MOB OFF", "OFF", "ANGL", "ARC", "COLD", "SCRSV",
+    "SCRLD", "TEXT", "CSET", "VOL", "DISK", "HRDCPY", "KEY", "PAINT", "LOW COL", "COPY", "MERGE",
+    "RENUMBER", "MEM", "DETECT", "CHECK", "DISPLAY", "ERR", "OUT",
+];
+
+/// Simons' BASIC: BASIC 2 with the cartridge's keywords.
+pub static SIMONS_BASIC: Dialect = Dialect {
+    name: "Simons' BASIC",
+    status: "Simons'",
+    keywords: &BASIC2,
+    simons: true,
+};
+
+/// The first byte of a Simons' BASIC keyword.
+pub const SIMONS_PREFIX: u8 = 0x64;
+/// DISAPA's number: the cartridge writes four colons after it, so the
+/// line keeps its length.
+const DISAPA: u8 = 0x41;
+
+/// The Simons' keyword with token number `n`, if it's one.
+fn simons_keyword(n: u8) -> Option<&'static str> {
+    let k = *SIMONS.get(usize::from(n).checked_sub(1)?)?;
+    (k != ">>").then_some(k)
+}
+
+/// Simons' BASIC's pass over a typed line before BASIC 2's CRUNCH (its
+/// cartridge `$AD2B`, called from its CRUNCH hook at `$8261`): at each
+/// capital letter outside quotes, the first of its keywords, in table
+/// order, that the text starts with becomes `$64` and its number. It
+/// doesn't know REM or DATA, so works there too; an `@` outside quotes
+/// ends the pass for the rest of the line.
+pub fn simons_pass(text: &[u8]) -> Vec<u8> {
+    let mut buf = text.to_vec();
+    let mut y = 0;
+    while y < buf.len() {
+        let a = buf[y];
+        if a == b'"' {
+            match buf[y + 1..].iter().position(|&b| b == b'"') {
+                Some(p) => {
+                    y += p + 2;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        if a == b'@' {
+            break;
+        }
+        if !a.is_ascii_uppercase() {
+            y += 1;
+            continue;
+        }
+        let found = SIMONS
+            .iter()
+            .position(|k| buf[y..].starts_with(k.as_bytes()));
+        match found {
+            Some(i) if i + 1 == usize::from(DISAPA) => {
+                buf.splice(y..y + 6, [SIMONS_PREFIX, DISAPA, b':', b':', b':', b':']);
+                y += 6;
+            }
+            Some(i) => {
+                buf.splice(y..y + SIMONS[i].len(), [SIMONS_PREFIX, i as u8 + 1]);
+                y += 2;
+            }
+            None => y += 1,
+        }
+    }
+    buf
+}
 
 pub const DATA: u8 = 0x83;
 pub const REM: u8 = 0x8F;
@@ -271,36 +361,50 @@ enum Mode {
     Rem,
 }
 
-/// A line's text as LIST shows it: keywords spelled out. After REM and
-/// DATA, bytes show as they are (so the program saves back unchanged).
-pub fn list(d: &Dialect, text: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len() * 2);
-    let mut mode = Mode::Normal;
-    let mut data_quote = false;
-    for &b in text {
-        match mode {
+/// LIST's state in a line (BASIC 2's view): which [`Mode`], and whether
+/// a string is inside DATA.
+struct Lister {
+    mode: Mode,
+    data_quote: bool,
+}
+
+impl Lister {
+    fn new() -> Self {
+        Self {
+            mode: Mode::Normal,
+            data_quote: false,
+        }
+    }
+
+    /// Show byte `b`, keywords spelled out.
+    fn byte(&mut self, d: &Dialect, out: &mut Vec<u8>, b: u8) {
+        match self.mode {
             Mode::Rem => out.push(b),
             Mode::Quote => {
                 out.push(b);
                 if b == b'"' {
-                    mode = if data_quote { Mode::Data } else { Mode::Normal };
+                    self.mode = if self.data_quote {
+                        Mode::Data
+                    } else {
+                        Mode::Normal
+                    };
                 }
             }
             Mode::Data => {
                 out.push(b);
                 match b {
                     b'"' => {
-                        data_quote = true;
-                        mode = Mode::Quote;
+                        self.data_quote = true;
+                        self.mode = Mode::Quote;
                     }
-                    b':' => mode = Mode::Normal,
+                    b':' => self.mode = Mode::Normal,
                     _ => {}
                 }
             }
             Mode::Normal => {
                 if b == b'"' {
-                    data_quote = false;
-                    mode = Mode::Quote;
+                    self.data_quote = false;
+                    self.mode = Mode::Quote;
                     out.push(b);
                 } else if b >= 0x80 && b != PI {
                     match d.keyword(b) {
@@ -308,8 +412,8 @@ pub fn list(d: &Dialect, text: &[u8]) -> Vec<u8> {
                         None => out.push(b),
                     }
                     match b {
-                        REM => mode = Mode::Rem,
-                        DATA => mode = Mode::Data,
+                        REM => self.mode = Mode::Rem,
+                        DATA => self.mode = Mode::Data,
                         _ => {}
                     }
                 } else {
@@ -317,6 +421,50 @@ pub fn list(d: &Dialect, text: &[u8]) -> Vec<u8> {
                 }
             }
         }
+    }
+}
+
+/// A line's text as LIST shows it: keywords spelled out. After REM and
+/// DATA, bytes show as they are (so the program saves back unchanged).
+/// Simons' keywords show wherever its pass would have made them (outside
+/// quotes, before any `@`), REM and DATA included, so typing the listing
+/// in again gives the same bytes.
+pub fn list(d: &Dialect, text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() * 2);
+    let mut lister = Lister::new();
+    // Simons' pass's view: in quotes, or past an @.
+    let mut quote = false;
+    let mut stopped = false;
+    let mut i = 0;
+    while i < text.len() {
+        let b = text[i];
+        if d.simons
+            && !quote
+            && !stopped
+            && b == SIMONS_PREFIX
+            && let Some(k) = text.get(i + 1).and_then(|&n| simons_keyword(n))
+        {
+            out.extend_from_slice(k.as_bytes());
+            let n = text[i + 1];
+            i += 2;
+            // The second byte went through BASIC 2's CRUNCH too (LOOP's
+            // is a colon, which ends DATA).
+            lister.byte(d, &mut Vec::new(), n);
+            if n == DISAPA && text[i..].starts_with(b"::::") {
+                for _ in 0..4 {
+                    lister.byte(d, &mut Vec::new(), b':');
+                }
+                i += 4;
+            }
+            continue;
+        }
+        if b == b'"' {
+            quote = !quote;
+        } else if b == b'@' && !quote {
+            stopped = true;
+        }
+        lister.byte(d, &mut out, b);
+        i += 1;
     }
     out
 }
@@ -431,6 +579,27 @@ fn line_number(line: &[u8]) -> Option<(u32, usize)> {
     (digits > 0).then_some((n, i))
 }
 
+/// Whether `program` has Simons' BASIC keywords (`$64` tokens where its
+/// pass would have made them).
+pub fn uses_simons(program: &Program) -> bool {
+    program.lines.iter().any(|(_, text)| {
+        let mut quote = false;
+        for (i, &b) in text.iter().enumerate() {
+            match b {
+                b'"' => quote = !quote,
+                b'@' if !quote => return false,
+                SIMONS_PREFIX
+                    if !quote && text.get(i + 1).and_then(|&n| simons_keyword(n)).is_some() =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    })
+}
+
 /// Whether `program` uses BASIC 4's disk commands (tokens `$CC-$DA`
 /// outside quotes, REM and DATA).
 pub fn uses_basic4(program: &Program) -> bool {
@@ -537,6 +706,7 @@ pub fn encode(d: &Dialect, lines: &[Vec<u8>], meta: &FileMeta, load: u16) -> Enc
             program.remove(&number);
             continue;
         }
+        let text = if d.simons { simons_pass(&text) } else { text };
         let (bytes, lost) = crunch(d, &text);
         if lost > 0 {
             dropped.push((number, index + 1, lost));
@@ -612,6 +782,12 @@ pub static C64_MEMORY: [Memory; 1] = [Memory {
     load_address: 0x0801,
     bytes_free: 38911,
 }];
+/// With the Simons' BASIC cartridge in (checked in VICE).
+pub static SIMONS_MEMORY: [Memory; 1] = [Memory {
+    name: "C64 with Simons' BASIC",
+    load_address: 0x0801,
+    bytes_free: 30719,
+}];
 pub static VIC20_MEMORY: [Memory; 3] = [
     Memory {
         name: "VIC-20 unexpanded",
@@ -659,13 +835,17 @@ impl FileFormat for CbmBasic {
         &["PRG"]
     }
 
+    /// A program; for Simons' BASIC, one using its keywords.
     fn detect(&self, bytes: &[u8]) -> bool {
-        parse(bytes).is_ok()
+        parse(bytes).is_ok_and(|p| !self.dialect.simons || uses_simons(&p))
     }
 
     /// Tokens the dialect doesn't know.
     fn misfit(&self, bytes: &[u8]) -> Option<usize> {
         let p = parse(bytes).ok()?;
+        if self.dialect.simons && !uses_simons(&p) {
+            return None;
+        }
         Some(
             p.lines
                 .iter()
@@ -919,6 +1099,27 @@ mod vice {
             memory: &C64_MEMORY,
         };
         assert_eq!(f.system_for(file, "c64"), Some("vic20"));
+    }
+
+    #[test]
+    fn simons_basic_matches_the_cartridge() {
+        let file = include_bytes!("../tests/data/c64-simons.prg");
+        let text = include_str!("../tests/data/c64-simons.txt");
+        let e = encode(&SIMONS_BASIC, &typed(text), &FileMeta::default(), 0x0801);
+        assert_eq!(e.bytes, file);
+        // Listed as typed (DISAPA's colons and all), and saved again: the
+        // same bytes.
+        let d = decode(&SIMONS_BASIC, file).unwrap();
+        assert_eq!(d.lines[6], b"70 DISAPA:PRINT");
+        assert_eq!(d.lines[4], b"50 PLOTX=1:A@HIRES");
+        assert_eq!(encode(&SIMONS_BASIC, &d.lines, &d.meta, 0x0801).bytes, file);
+        // Recognised as Simons' BASIC; a plain program isn't.
+        let simons = CbmBasic {
+            dialect: &SIMONS_BASIC,
+            memory: &SIMONS_MEMORY,
+        };
+        assert!(simons.detect(file));
+        assert!(!simons.detect(include_bytes!("../tests/data/c64-crunch.prg")));
     }
 
     #[test]

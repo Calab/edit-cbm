@@ -1,0 +1,11 @@
+10 hires 0,1:colour 1,2:print "hires"
+20 rem hires plot
+30 data plot,"line":loop
+40 if a then 10:else print
+50 plotx=1:a@hires
+60 end proc:end
+70 disapa:print
+80 hi col 1:hicol
+90 else goto 10:elsegoto10
+100 on error:on key "a"
+110 data loop:loop
