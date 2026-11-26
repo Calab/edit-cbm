@@ -14,7 +14,7 @@ pub use model::Model;
 
 use retro_core::FileFormat;
 
-use basic::{BASIC_2, BASIC_4, CbmBasic};
+use basic::{BASIC_1, BASIC_2, BASIC_4, C64_MEMORY, CbmBasic, PET_MEMORY, VIC20_MEMORY};
 
 /// Each model's file formats, most specific first; plain PETSCII text
 /// last. BASIC programs are saved at the model's usual load address
@@ -22,26 +22,31 @@ use basic::{BASIC_2, BASIC_4, CbmBasic};
 pub static C64_FORMATS: &[&dyn FileFormat] = &[
     &CbmBasic {
         dialect: &BASIC_2,
-        load: 0x0801,
+        memory: &C64_MEMORY,
     },
     &petscii::PetsciiText,
 ];
 pub static VIC20_FORMATS: &[&dyn FileFormat] = &[
     &CbmBasic {
         dialect: &BASIC_2,
-        load: 0x1001,
+        memory: &VIC20_MEMORY,
     },
     &petscii::PetsciiText,
 ];
-/// BASIC 4 first: a program both can read opens as BASIC 4.
+/// BASIC 4 first: a program all three can read opens as BASIC 4
+/// (Reopen As picks another).
 pub static PET_FORMATS: &[&dyn FileFormat] = &[
     &CbmBasic {
         dialect: &BASIC_4,
-        load: 0x0401,
+        memory: &PET_MEMORY,
     },
     &CbmBasic {
         dialect: &BASIC_2,
-        load: 0x0401,
+        memory: &PET_MEMORY,
+    },
+    &CbmBasic {
+        dialect: &BASIC_1,
+        memory: &PET_MEMORY,
     },
     &petscii::PetsciiText,
 ];

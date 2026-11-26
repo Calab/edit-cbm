@@ -10,14 +10,14 @@
 //! Tokens are `$80` + the keyword's place in the dialect's table; `$FF` is
 //! π. Tables from the ROMs: BASIC 2 (C64 `$A09E`, the same on the VIC-20
 //! and PET BASIC 2) and BASIC 4 (PET `$B0B2`, BASIC 2's plus 15 disk
-//! commands).
+//! commands). BASIC 1 (the first PET) is BASIC 2 without GO.
 //!
 //! [`crunch`] is a port of BASIC's CRUNCH routine (C64 `$A579`, PET BASIC
 //! 4 `$B4FB`, the same algorithm), so lines are stored as the machine
 //! stores them; [`list`] mirrors it, so a program read and written back
 //! comes out byte for byte.
 
-use retro_core::{Decoded, Document, Encoded, FileFormat, FileMeta};
+use retro_core::{Decoded, Document, Encoded, FileFormat, FileMeta, Memory};
 
 /// A BASIC version: its keywords, from token `$80`.
 pub struct Dialect {
@@ -130,6 +130,13 @@ const BASIC4: [&str; 91] = [
     "SCRATCH",
     "DIRECTORY",
 ];
+
+/// The first PET's BASIC: BASIC 2's keywords without GO.
+pub static BASIC_1: Dialect = Dialect {
+    name: "BASIC 1.0",
+    status: "BASIC 1",
+    keywords: BASIC2.split_at(75).0,
+};
 
 pub static BASIC_2: Dialect = Dialect {
     name: "BASIC 2.0",
@@ -598,11 +605,41 @@ pub fn encode(d: &Dialect, lines: &[Vec<u8>], meta: &FileMeta, load: u16) -> Enc
     }
 }
 
-/// A tokenized BASIC program in dialect `dialect`, as one model saves it
-/// (`load` is where its programs start).
+/// The memory set-ups: where BASIC starts and BYTES FREE at power-on,
+/// the largest standard memory for each start address (S2).
+pub static C64_MEMORY: [Memory; 1] = [Memory {
+    name: "C64",
+    load_address: 0x0801,
+    bytes_free: 38911,
+}];
+pub static VIC20_MEMORY: [Memory; 3] = [
+    Memory {
+        name: "VIC-20 unexpanded",
+        load_address: 0x1001,
+        bytes_free: 3583,
+    },
+    Memory {
+        name: "VIC-20 +3K",
+        load_address: 0x0401,
+        bytes_free: 6655,
+    },
+    Memory {
+        name: "VIC-20 +24K",
+        load_address: 0x1201,
+        bytes_free: 28159,
+    },
+];
+pub static PET_MEMORY: [Memory; 1] = [Memory {
+    name: "PET 32K",
+    load_address: 0x0401,
+    bytes_free: 31743,
+}];
+
+/// A tokenized BASIC program in dialect `dialect`, as one model saves it:
+/// for one of `memory`, the first unless the document says.
 pub struct CbmBasic {
     pub dialect: &'static Dialect,
-    pub load: u16,
+    pub memory: &'static [Memory],
 }
 
 impl FileFormat for CbmBasic {
@@ -668,12 +705,16 @@ impl FileFormat for CbmBasic {
         })
     }
 
+    fn memory(&self) -> &'static [Memory] {
+        self.memory
+    }
+
     fn can_encode(&self) -> bool {
         true
     }
 
     fn encode(&self, doc: &Document) -> Result<Encoded, String> {
-        let load = doc.meta.load_address.unwrap_or(self.load);
+        let load = doc.meta.load_address.unwrap_or(self.memory[0].load_address);
         Ok(encode(self.dialect, doc.lines(), &doc.meta, load))
     }
 }
@@ -775,6 +816,13 @@ mod tests {
     }
 
     #[test]
+    fn basic_1_has_no_go() {
+        assert_eq!(crunch(&BASIC_1, b"GO TO").0, b"GO \xa4");
+        assert_eq!(crunch(&BASIC_1, b"GOTO").0, b"\x89");
+        assert_eq!(list(&BASIC_1, b"\xcb"), b"\xcb");
+    }
+
+    #[test]
     fn warnings() {
         let lines = vec![b"PRINT".to_vec(), b"10 A\xc1".to_vec(), b"70000 X".to_vec()];
         let e = encode(&BASIC_2, &lines, &FileMeta::default(), 0x0801);
@@ -802,7 +850,7 @@ mod tests {
     fn detection_and_systems() {
         let f = CbmBasic {
             dialect: &BASIC_2,
-            load: 0x0801,
+            memory: &C64_MEMORY,
         };
         let c64 = program(&[b"10 PRINT"]);
         assert!(f.detect(&c64));
@@ -822,7 +870,7 @@ mod tests {
         assert_eq!(f.misfit(&p4), Some(1));
         let f4 = CbmBasic {
             dialect: &BASIC_4,
-            load: 0x0401,
+            memory: &PET_MEMORY,
         };
         assert_eq!(f4.misfit(&p4), Some(0));
     }
@@ -868,7 +916,7 @@ mod vice {
         assert_eq!(e.bytes, file);
         let f = CbmBasic {
             dialect: &BASIC_2,
-            load: 0x0801,
+            memory: &C64_MEMORY,
         };
         assert_eq!(f.system_for(file, "c64"), Some("vic20"));
     }
@@ -885,7 +933,7 @@ mod vice {
         // Its disk commands make it a PET program, from any system.
         let f = CbmBasic {
             dialect: &BASIC_2,
-            load: 0x0801,
+            memory: &C64_MEMORY,
         };
         assert_eq!(f.system_for(file, "vic20"), Some("pet"));
     }

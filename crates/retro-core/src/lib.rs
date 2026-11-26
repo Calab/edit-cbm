@@ -21,7 +21,7 @@ pub mod tabs;
 
 pub use document::{Document, Pos, Snapshot};
 pub use editor::Editor;
-pub use format::{Encoded, FileFormat};
+pub use format::{Encoded, FileFormat, Memory};
 pub use input::{EditAction, Key, KeyInput, KeyboardRules, Mods};
 pub use layout::{HideRule, Layout, WrapMode};
 pub use machine::{CaseOffer, CodeEffect, Decoded, FileMeta, Machine};

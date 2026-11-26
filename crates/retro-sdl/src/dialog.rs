@@ -40,6 +40,11 @@ pub enum Purpose {
     SaveWarning,
     /// A program has bytes after it (machine code?): Keep / Strip Off.
     Trailer,
+    /// Which memory set-up a program is for: one button each, then Cancel.
+    ChooseMemory(&'static [retro_core::Memory]),
+    /// A program of this size too big for its memory: Move to each set-up
+    /// that would hold it ([`bigger`]), then Save Anyway, then Cancel.
+    TooBig(&'static [retro_core::Memory], usize),
     /// Choose the format to save in; the buttons are the formats' names,
     /// then Cancel.
     SaveAsFormat,
@@ -183,6 +188,65 @@ impl Dialog {
             buttons: vec!["Save Anyway", "Cancel"],
             focus: 1,
             cancel: 1,
+            button_rects: Vec::new(),
+        }
+    }
+
+    /// Buttons: one per memory set-up, then Cancel.
+    pub fn choose_memory(file_name: &str, memory: &'static [retro_core::Memory]) -> Self {
+        let mut buttons: Vec<&'static str> = memory.iter().map(|m| m.name).collect();
+        buttons.push("Cancel");
+        let sizes: Vec<String> = memory
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}: loads at ${:04X}, {} bytes free",
+                    m.name, m.load_address, m.bytes_free
+                )
+            })
+            .collect();
+        Self {
+            purpose: Purpose::ChooseMemory(memory),
+            title: "Which memory?".into(),
+            text: format!(
+                "Which machine is {file_name} for? Where a program loads \
+                 depends on the memory fitted:\n\n    {}",
+                sizes.join("\n    ")
+            ),
+            cancel: buttons.len() - 1,
+            buttons,
+            focus: 0,
+            button_rects: Vec::new(),
+        }
+    }
+
+    /// Buttons: Move to each of [`bigger`], then Save Anyway, then Cancel.
+    pub fn too_big(
+        size: usize,
+        memory: &retro_core::Memory,
+        all: &'static [retro_core::Memory],
+    ) -> Self {
+        let bigger = bigger(all, size);
+        let mut buttons: Vec<&'static str> = bigger
+            .iter()
+            .map(|m| &*Box::leak(format!("Move to {}", m.name).into_boxed_str()))
+            .collect();
+        buttons.extend(["Save Anyway", "Cancel"]);
+        let offer = if bigger.is_empty() {
+            String::new()
+        } else {
+            " Moving it to a machine with more memory re-links it to load there.".into()
+        };
+        Self {
+            purpose: Purpose::TooBig(all, size),
+            title: "Program too big".into(),
+            text: format!(
+                "The program takes {size} bytes, more than the {} bytes free on a {}.{offer}",
+                memory.bytes_free, memory.name
+            ),
+            cancel: buttons.len() - 1,
+            focus: buttons.len() - 1,
+            buttons,
             button_rects: Vec::new(),
         }
     }
@@ -418,4 +482,12 @@ fn wrap(font: &mut UiFont, text: &str, max_w: i32) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// The memory set-ups in `all` that would hold a program of `size` bytes.
+pub fn bigger(all: &[retro_core::Memory], size: usize) -> Vec<retro_core::Memory> {
+    all.iter()
+        .filter(|m| m.bytes_free >= size)
+        .copied()
+        .collect()
 }

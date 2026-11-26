@@ -55,10 +55,12 @@ struct PendingSave {
     replace: bool,
     format: &'static dyn FileFormat,
     then: Option<After>,
-    /// The user agreed to save lines as ERROR- lines.
+    /// The user agreed to save despite the format's warning.
     confirmed: bool,
     /// The user agreed to save over a file another program changed.
     overwrite: bool,
+    /// The user agreed to save a program too big for its memory.
+    too_big_ok: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -678,9 +680,24 @@ impl App {
                 if e.kind() == std::io::ErrorKind::NotFound
                     && matches!(source, Source::File(_)) =>
             {
-                self.format = self.sys.machine.text_format();
+                // In the format its extension names (BASIC for .PRG).
+                let ext = source.extension();
+                self.format = self
+                    .sys
+                    .machine
+                    .formats()
+                    .iter()
+                    .copied()
+                    .find(|f| {
+                        ext.as_deref().is_some_and(|e| {
+                            f.can_encode()
+                                && (f.extension().eq_ignore_ascii_case(e)
+                                    || f.extensions().iter().any(|x| x.eq_ignore_ascii_case(e)))
+                        })
+                    })
+                    .unwrap_or_else(|| self.sys.machine.text_format());
                 self.new_editor(Document::new());
-                self.message = Some("New file".into());
+                self.message = Some(format!("New file ({})", self.format.name()));
             }
             Err(e) => {
                 self.message = Some(format!("Can't open {}: {e}", describe(&source)));
@@ -941,6 +958,7 @@ impl App {
                 then: None,
                 confirmed: false,
                 overwrite: false,
+                too_big_ok: false,
             }),
             (FileJobKind::Export(kind), Some(path)) => self.export_to(&path, kind),
             (_, None) => {} // cancelled
@@ -1042,6 +1060,7 @@ impl App {
                 then,
                 confirmed: false,
                 overwrite: false,
+                too_big_ok: false,
             }),
             _ => self.start_file_job(FileJobKind::SaveAs { then }),
         }
@@ -1082,6 +1101,7 @@ impl App {
             then,
             confirmed: false,
             overwrite: false,
+            too_big_ok: false,
         };
         if uses(&text) {
             return self.save_to(pending(text));
@@ -1128,6 +1148,15 @@ impl App {
     /// Write a pending save, first asking if lines would be saved as
     /// ERROR- lines. On success the file becomes the document's.
     fn save_to(&mut self, save: PendingSave) {
+        // A program for one of several memory set-ups (the VIC-20's) that
+        // isn't for any of them yet: ask which.
+        let memory = save.format.memory();
+        let load = self.editor.doc.meta.load_address;
+        if memory.len() > 1 && !memory.iter().any(|m| Some(m.load_address) == load) {
+            self.dialog = Some(Dialog::choose_memory(&save.target.name(), memory));
+            self.pending_save = Some(save);
+            return;
+        }
         let encoded = match save.format.encode(&self.editor.doc) {
             Ok(e) => e,
             Err(e) => {
@@ -1157,6 +1186,26 @@ impl App {
                 Source::Image { .. } => file_label(&save.target.host().to_string_lossy()),
             };
             self.dialog = Some(Dialog::overwrite_changed(&changed));
+            self.pending_save = Some(save);
+            return;
+        }
+        // Too big for its memory: offer the larger set-ups that would hold
+        // it (moving the program there), or save anyway.
+        let size = encoded
+            .bytes
+            .len()
+            .saturating_sub(2 + self.editor.doc.meta.trailer.len());
+        let load = self
+            .editor
+            .doc
+            .meta
+            .load_address
+            .or(memory.first().map(|m| m.load_address));
+        if let Some(m) = memory.iter().find(|m| Some(m.load_address) == load)
+            && size > m.bytes_free
+            && !save.too_big_ok
+        {
+            self.dialog = Some(Dialog::too_big(size, m, memory));
             self.pending_save = Some(save);
             return;
         }
@@ -1263,6 +1312,27 @@ impl App {
                 1 => self.perform(after),
                 _ => {}
             },
+            Purpose::ChooseMemory(_) | Purpose::TooBig(..) => {
+                let (choices, too_big) = match d.purpose {
+                    Purpose::TooBig(all, size) => (crate::dialog::bigger(all, size), true),
+                    Purpose::ChooseMemory(all) => (all.to_vec(), false),
+                    _ => unreachable!(),
+                };
+                if let Some(mut save) = self.pending_save.take() {
+                    if let Some(m) = choices.get(button) {
+                        // For this memory: moved, if it was for another.
+                        if self.editor.doc.meta.load_address.is_some() {
+                            self.editor.doc.mark_modified();
+                        }
+                        self.editor.doc.meta.load_address = Some(m.load_address);
+                        self.message = Some(format!("Program for {}", m.name));
+                        self.save_to(save);
+                    } else if too_big && button == choices.len() {
+                        save.too_big_ok = true;
+                        self.save_to(save);
+                    }
+                }
+            }
             Purpose::Trailer => {
                 if button == 1 {
                     let n = self.editor.doc.meta.trailer.len();
@@ -1406,6 +1476,7 @@ impl App {
             then: None,
             confirmed: false,
             overwrite: false,
+            too_big_ok: false,
         });
     }
 
@@ -1706,6 +1777,17 @@ impl App {
         self.load_fonts();
         self.set_charset(self.config.charset);
         self.editor.tabs = self.sys.machine.default_tab_stops();
+        // The document is now in the new system's format of the same name
+        // (its BASIC 2.0, say), or its text format.
+        let format = self.format.name();
+        self.format = self
+            .sys
+            .machine
+            .formats()
+            .iter()
+            .copied()
+            .find(|f| f.name() == format)
+            .unwrap_or_else(|| self.sys.machine.text_format());
         self.rebuild_menus();
         self.message = Some(format!(
             "{name}: {} columns",

@@ -65,6 +65,14 @@ pub trait FileFormat: Sync {
         None
     }
 
+    /// The memory set-ups a program in this format can be for, smallest
+    /// first (the VIC-20 unexpanded, +3K, +24K). Empty for formats without
+    /// a load address. With more than one, a document with no load address
+    /// asks which on its first save.
+    fn memory(&self) -> &'static [Memory] {
+        &[]
+    }
+
     /// Whether [`FileFormat::encode`] is available.
     fn can_encode(&self) -> bool {
         false
@@ -74,6 +82,16 @@ pub trait FileFormat: Sync {
     fn encode(&self, _doc: &Document) -> Result<Encoded, String> {
         Err(format!("{} files can't be written yet", self.name()))
     }
+}
+
+/// A memory set-up a program can be saved for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Memory {
+    /// E.g. "VIC-20 +3K".
+    pub name: &'static str,
+    pub load_address: u16,
+    /// BASIC's BYTES FREE at power-on: the most a program can take.
+    pub bytes_free: usize,
 }
 
 /// A document written in a format.
