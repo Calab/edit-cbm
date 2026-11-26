@@ -18,6 +18,9 @@ pub struct Palette {
     /// inverse video so selections can't be mistaken for inverse text.
     pub selection: (u8, u8, u8),
     pub selection_text: (u8, u8, u8),
+    /// Control codes when Highlight Codes is on: a colour the machine
+    /// doesn't have, so they stand out.
+    pub codes: (u8, u8, u8),
 }
 
 /// A machine's selectable colours as a grid of hues x luminances (the

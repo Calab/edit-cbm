@@ -32,10 +32,10 @@ use render::{ColorModel, Palette};
 
 /// The window icon: the icon character filling 64x64 pixels, as the
 /// icon files in `assets/icons` are drawn.
-fn window_icon(spec: &AppSpec) -> Option<sdl2::surface::Surface<'static>> {
+fn window_icon(sys: &System, icon: u8) -> Option<sdl2::surface::Surface<'static>> {
     const SIZE: u32 = 64;
-    let glyph = spec.machine.glyph(spec.icon);
-    let (bg, fg) = (spec.palette.background, spec.palette.foreground);
+    let glyph = sys.machine.glyph(icon);
+    let (bg, fg) = (sys.palette.background, sys.palette.foreground);
     let mut surface =
         sdl2::surface::Surface::new(SIZE, SIZE, sdl2::pixels::PixelFormatEnum::RGBA32).ok()?;
     let pitch = surface.pitch() as usize;
@@ -51,34 +51,47 @@ fn window_icon(spec: &AppSpec) -> Option<sdl2::surface::Surface<'static>> {
     Some(surface)
 }
 
-/// Everything that makes an editor specific to one machine.
-pub struct AppSpec {
-    /// Program name and window title, e.g. "Edit Atari".
-    pub title: &'static str,
-    /// Folder name for settings, e.g. "atari_editor".
-    pub app_id: &'static str,
+/// One computer the editor can show: a window shows one system at a
+/// time, and can switch to another.
+pub struct System {
+    /// Settings key, e.g. "c64".
+    pub id: &'static str,
     pub machine: Box<dyn Machine>,
-    /// The disk images the machine reads, for File > Open from Image and
-    /// Save to Image. Without them, those menu items aren't shown.
-    pub disks: Option<Box<dyn retro_core::disk::DiskImages>>,
     pub keyboard: Box<dyn KeyboardRules>,
     pub palette: Palette,
-    /// The character code drawn as the window icon, in the palette's
-    /// foreground and background colours.
-    pub icon: u8,
-    /// Selectable text/background colours, if the machine
-    /// has a colour model. Without one, `palette` is used as is.
+    /// Selectable text/background colours, if the machine has a colour
+    /// model. Without one, `palette` is used as is.
     pub colors: Option<ColorModel>,
-    /// File-dialog filters, one per language: (name, extensions without
-    /// dots, in upper case). The dialogs also offer all of them together
-    /// as "Atari files", and "All files".
-    pub file_types: &'static [(&'static str, &'static [&'static str])],
     /// Machine-specific lines appended to the help screen. A run of two or
     /// more spaces separates a key from its description.
     pub help: &'static [&'static str],
+    /// The default line-length warning column (the screen editor's
+    /// logical line).
+    pub line_warning: usize,
+}
+
+/// Everything that makes the editor specific to its machines.
+pub struct AppSpec {
+    /// Program name and window title, e.g. "Edit CBM".
+    pub title: &'static str,
+    /// Folder name for settings, e.g. "edit-cbm".
+    pub app_id: &'static str,
+    /// The systems, in menu order. A new window starts in the one last
+    /// chosen (the first, the first time).
+    pub systems: Vec<System>,
+    /// The disk images the machine reads, for File > Open from Image and
+    /// Save to Image. Without them, those menu items aren't shown.
+    pub disks: Option<Box<dyn retro_core::disk::DiskImages>>,
+    /// The character code drawn as the window icon, in the palette's
+    /// foreground and background colours.
+    pub icon: u8,
+    /// File-dialog filters, one per language: (name, extensions without
+    /// dots, in upper case). The dialogs also offer all of them together,
+    /// and "All files".
+    pub file_types: &'static [(&'static str, &'static [&'static str])],
     /// The file types the editor reads and writes, for Help > File Types.
-    /// Laid out like `help`: two or more spaces separate the extension
-    /// from its description.
+    /// Laid out like `System::help`: two or more spaces separate the
+    /// extension from its description.
     pub file_types_help: &'static [&'static str],
     /// Program name, version, author and copyright, for Help > About.
     pub about: String,
@@ -100,7 +113,7 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
 
     // The window opens small; its real size is set below, once the
     // display's pixel density is known.
-    let native_cols = app.spec.machine.screen_columns() as u32 + 4;
+    let native_cols = app.sys.machine.screen_columns() as u32 + 4;
     let native_rows = 24 + 5;
     let mut window = video
         .window(app.spec.title, native_cols * 8, native_rows * 8)
@@ -109,7 +122,7 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
         .allow_highdpi()
         .build()
         .map_err(|e| e.to_string())?;
-    if let Some(icon) = window_icon(&app.spec) {
+    if let Some(icon) = window_icon(&app.sys, app.spec.icon) {
         window.set_icon(icon);
     }
     // Fonts chosen in the settings, now that the icon has the built-in A.
@@ -120,7 +133,7 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     let creator = canvas.texture_creator();
-    let mut atlas = render::build_atlas(&creator, app.spec.machine.as_ref())?;
+    let mut atlas = render::build_atlas(&creator, app.sys.machine.as_ref())?;
 
     // Size the interface for the display's pixel density.
     let (pw, _) = canvas.output_size()?;
@@ -397,6 +410,13 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
         app.text_input(&text, sdl2::keyboard::Mod::NOMOD, &frame.layout);
         app.test_save();
     }
+    // Switch to the nth system (System menu order).
+    if let Some(n) = std::env::var("RETRO_EDITOR_SYSTEM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        app.switch_system(n);
+    }
     // Press dialog buttons in turn, e.g. "0,0".
     if let Ok(list) = std::env::var("RETRO_EDITOR_CHOOSE") {
         for n in list.split(',').filter_map(|n| n.trim().parse().ok()) {
@@ -540,7 +560,7 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
         }
 
         if std::mem::take(&mut app.charset_changed) {
-            atlas = render::build_atlas(&creator, app.spec.machine.as_ref())?;
+            atlas = render::build_atlas(&creator, app.sys.machine.as_ref())?;
         }
         if app::App::gutter_font_px(app.config.scale * 8) != gutter.px() {
             gutter = mono.resized(app::App::gutter_font_px(app.config.scale * 8));

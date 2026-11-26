@@ -11,8 +11,8 @@ use retro_core::{
 use sdl2::clipboard::ClipboardUtil;
 use sdl2::keyboard::{Keycode, Mod};
 
-use crate::AppSpec;
 use crate::render::rgb;
+use crate::{AppSpec, System};
 use sdl2::pixels::Color;
 
 /// The colours of the machine's screen for one frame.
@@ -23,6 +23,7 @@ pub struct ScreenColors {
     pub warning: Color,
     pub selection: Color,
     pub selection_text: Color,
+    pub codes: Color,
 }
 use crate::dialog::{After, Dialog, Purpose};
 
@@ -153,6 +154,12 @@ pub struct Ctx<'a> {
 
 pub struct App {
     pub spec: AppSpec,
+    /// The system this window shows.
+    pub sys: System,
+    /// The other systems, to switch to.
+    spare: Vec<System>,
+    /// Every system's id and name, in menu order.
+    system_list: Vec<(&'static str, &'static str)>,
     pub config: Config,
     pub editor: Editor,
     /// Where the document came from, and where Save writes it.
@@ -243,31 +250,53 @@ pub struct App {
 
 impl App {
     pub fn new(mut spec: AppSpec) -> Self {
-        let config = Config::load(spec.app_id);
-        let charset = config.charset.min(spec.machine.charsets().len() - 1);
-        spec.machine.set_charset(charset);
-        spec.keyboard.set_charset(charset);
+        let mut config = Config::load(spec.app_id);
+        // The system last chosen, or the first.
+        let mut spare = std::mem::take(&mut spec.systems);
+        assert!(!spare.is_empty(), "an editor has at least one system");
+        let system_list: Vec<(&'static str, &'static str)> =
+            spare.iter().map(|s| (s.id, s.machine.name())).collect();
+        let i = spare
+            .iter()
+            .position(|s| s.id == config.system)
+            .unwrap_or(0);
+        let mut sys = spare.remove(i);
+        if !config.switch_to(sys.id) {
+            config.line_warning = sys.line_warning;
+        }
+        let charset = config.charset.min(sys.machine.charsets().len() - 1);
+        sys.machine.set_charset(charset);
+        sys.keyboard.set_charset(charset);
         // The Options menu toggles the second character set, if any.
-        let alt_charset = spec
+        let alt_charset = sys
             .machine
             .charsets()
             .get(1)
             .map(|name| &*Box::leak(format!("&{name} Character Set").into_boxed_str()));
-        let format = spec.machine.text_format();
+        let format = sys.machine.text_format();
         let editor = Editor::new(
             Document::new(),
             config.wrap,
-            spec.machine.default_tab_stops(),
+            sys.machine.default_tab_stops(),
         );
-        let menus = menu::menus(alt_charset, &config.recent, spec.disks.is_some());
+        let menus = menu::menus(
+            alt_charset,
+            &config.recent,
+            spec.disks.is_some(),
+            &system_list,
+            sys.machine.screen_columns(),
+        );
         let config_initial = config.clone();
         let field = Editor::new(
             Document::new(),
             WrapMode::Window,
-            spec.machine.default_tab_stops(),
+            sys.machine.default_tab_stops(),
         );
         Self {
             spec,
+            sys,
+            spare,
+            system_list,
             config,
             editor,
             source: None,
@@ -324,7 +353,7 @@ impl App {
         let (a, _) = self.editor.selection()?;
         let mut text = self.editor.copy()?;
         if !self.config.show_codes && self.config.act_on_codes {
-            let m = self.spec.machine.as_ref();
+            let m = self.sys.machine.as_ref();
             let look = attrs::state_at(m, self.editor.doc.lines(), a);
             let codes = attrs::codes_between(m, attrs::Attr::default(), look, None);
             text[0].splice(0..0, codes);
@@ -338,7 +367,7 @@ impl App {
         if !self.config.act_on_codes || text.is_empty() {
             return text;
         }
-        let m = self.spec.machine.as_ref();
+        let m = self.sys.machine.as_ref();
         let lines = self.editor.doc.lines();
         let cur = self.editor.doc.cursor();
         let (a, b) = self.editor.selection().unwrap_or((cur, cur));
@@ -353,7 +382,7 @@ impl App {
     /// The text, background and border colours as (hue, lum), if the
     /// machine has a colour model.
     pub fn color_choice(&self) -> Option<[(u8, u8); 3]> {
-        let m = self.spec.colors?;
+        let m = self.sys.colors?;
         let fix = |(h, l): (u8, u8)| (h.min(m.hues - 1), l.min(m.lums - 1));
         Some([
             fix(self.config.text_color.unwrap_or(m.default_text)),
@@ -363,7 +392,7 @@ impl App {
     }
 
     pub fn screen_colors(&self) -> ScreenColors {
-        let pal = self.spec.palette;
+        let pal = self.sys.palette;
         let mut c = ScreenColors {
             text: rgb(pal.foreground),
             background: rgb(pal.background),
@@ -371,8 +400,9 @@ impl App {
             warning: rgb(pal.warning),
             selection: rgb(pal.selection),
             selection_text: rgb(pal.selection_text),
+            codes: rgb(pal.codes),
         };
-        if let (Some(m), Some([text, back, border])) = (self.spec.colors, self.color_choice()) {
+        if let (Some(m), Some([text, back, border])) = (self.sys.colors, self.color_choice()) {
             let look = |(h, l): (u8, u8)| rgb((m.rgb)(h, l));
             c.text = look(text);
             c.background = look(back);
@@ -422,11 +452,9 @@ impl App {
             0
         };
         let cols = (width.saturating_sub(gutter_w) / cell) as usize;
-        let mut layout = self.editor.layout(self.spec.machine.as_ref(), cols, rows);
+        let mut layout = self.editor.layout(self.sys.machine.as_ref(), cols, rows);
         if !self.config.show_codes {
-            layout.hide = Some(retro_core::HideRule::for_machine(
-                self.spec.machine.as_ref(),
-            ));
+            layout.hide = Some(retro_core::HideRule::for_machine(self.sys.machine.as_ref()));
         }
         // In 40 columns, the line numbers and the screen are centred
         // together; if they don't fit, the right border goes first.
@@ -562,8 +590,8 @@ impl App {
     fn open_source_as(&mut self, source: Source, forced: Option<&'static dyn FileFormat>) {
         match self.read_source(&source) {
             Ok(bytes) => {
-                let formats = self.spec.machine.formats();
-                let text = self.spec.machine.text_format();
+                let formats = self.sys.machine.formats();
+                let text = self.sys.machine.text_format();
                 let ext = source.extension();
                 let fmt = forced.unwrap_or_else(|| format::detect(formats, &bytes, ext.as_deref()));
                 let d = match fmt.decode(&bytes) {
@@ -579,7 +607,7 @@ impl App {
                 // has no $9B line ends and may well hold CR or LF bytes.
                 if forced.is_none()
                     && format::same(fmt, text)
-                    && self.spec.machine.looks_like_pc_text(&bytes)
+                    && self.sys.machine.looks_like_pc_text(&bytes)
                 {
                     self.message = Some("PC text? Use File > Import".into());
                 }
@@ -611,7 +639,7 @@ impl App {
                 if e.kind() == std::io::ErrorKind::NotFound
                     && matches!(source, Source::File(_)) =>
             {
-                self.format = self.spec.machine.text_format();
+                self.format = self.sys.machine.text_format();
                 self.new_editor(Document::new());
                 self.message = Some("New file".into());
             }
@@ -638,11 +666,11 @@ impl App {
                 return;
             }
         };
-        let d = self.spec.machine.import_text(&bytes);
-        let offer = self.spec.machine.case_offer(&d.lines);
+        let d = self.sys.machine.import_text(&bytes);
+        let offer = self.sys.machine.case_offer(&d.lines);
         let mut doc = Document::from_lines(d.lines, d.final_eol);
         doc.mark_modified();
-        let text = self.spec.machine.text_format();
+        let text = self.sys.machine.text_format();
         self.format = text;
         self.new_editor(doc);
         self.source = None;
@@ -696,7 +724,7 @@ impl App {
             .collect();
         let mut d = rfd::FileDialog::new()
             .set_title(title)
-            .add_filter(format!("{} files", self.spec.machine.name()), &both(&all));
+            .add_filter(format!("{} files", self.sys.machine.name()), &both(&all));
         for (name, exts) in self.spec.file_types {
             let shown: Vec<String> = exts.iter().map(|e| format!(".{e}")).collect();
             d = d.add_filter(format!("{name} ({})", shown.join(", ")), &both(exts));
@@ -870,7 +898,7 @@ impl App {
             (FileJobKind::SaveListingAs, Some(path)) => self.save_to(PendingSave {
                 target: Source::File(path),
                 replace: true,
-                format: self.spec.machine.text_format(),
+                format: self.sys.machine.text_format(),
                 then: None,
                 confirmed: false,
                 overwrite: false,
@@ -888,7 +916,7 @@ impl App {
     /// The document as PC text with this platform's line endings, and how
     /// many characters had no exact equivalent.
     fn export_text(&self, kind: ExportKind) -> (String, usize) {
-        let machine = &self.spec.machine;
+        let machine = &self.sys.machine;
         let newline = if cfg!(windows) { "\r\n" } else { "\n" };
         let doc = &self.editor.doc;
         let lines = doc.lines();
@@ -960,7 +988,7 @@ impl App {
     fn listing_name(&self) -> String {
         with_extension_like(
             &self.file_name(),
-            self.spec.machine.text_format().extension(),
+            self.sys.machine.text_format().extension(),
         )
     }
 
@@ -998,7 +1026,7 @@ impl App {
     /// of [`App::save_as_to`]. A file already in a disk image is replaced
     /// only after asking (the OS dialog has asked about other files).
     fn save_as_target(&mut self, target: Source, then: Option<After>) {
-        let text = self.spec.machine.text_format();
+        let text = self.sys.machine.text_format();
         let ext = target.extension().unwrap_or_default().to_ascii_uppercase();
         let replace = matches!(target, Source::File(_));
         let uses = |f: &&'static dyn FileFormat| {
@@ -1020,7 +1048,7 @@ impl App {
             return self.save_to(pending(text));
         }
         let users: Vec<&'static dyn FileFormat> = self
-            .spec
+            .sys
             .machine
             .formats()
             .iter()
@@ -1174,7 +1202,7 @@ impl App {
     fn perform(&mut self, after: After) {
         match after {
             After::New => {
-                self.format = self.spec.machine.text_format();
+                self.format = self.sys.machine.text_format();
                 self.new_editor(Document::new());
                 self.source = None;
                 self.message = None;
@@ -1213,7 +1241,7 @@ impl App {
             Purpose::SaveAsFormat => {
                 let name = d.buttons.get(button).copied();
                 let chosen = self
-                    .spec
+                    .sys
                     .machine
                     .formats()
                     .iter()
@@ -1271,7 +1299,7 @@ impl App {
             Purpose::ReopenAs => {
                 let name = d.buttons.get(button).copied();
                 let chosen = self
-                    .spec
+                    .sys
                     .machine
                     .formats()
                     .iter()
@@ -1297,7 +1325,7 @@ impl App {
             }
         };
         let formats: Vec<&'static str> = self
-            .spec
+            .sys
             .machine
             .formats()
             .iter()
@@ -1331,7 +1359,7 @@ impl App {
         self.save_to(PendingSave {
             target: Source::File(path),
             replace: true,
-            format: self.spec.machine.text_format(),
+            format: self.sys.machine.text_format(),
             then: None,
             confirmed: false,
             overwrite: false,
@@ -1465,10 +1493,17 @@ impl App {
             list.insert(0, p.clone());
             list.truncate(config::MAX_RECENT);
         }
+        self.rebuild_menus();
+    }
+
+    /// Make the menus again (the recent files or the system changed).
+    fn rebuild_menus(&mut self) {
         self.menus = menu::menus(
             self.alt_charset,
             &self.config.recent,
             self.spec.disks.is_some(),
+            &self.system_list,
+            self.sys.machine.screen_columns(),
         );
     }
 
@@ -1486,11 +1521,7 @@ impl App {
             self.message = Some(format!("{gone} is no longer there"));
             self.config.recent.retain(|q| q != &p);
             self.opened.retain(|q| q != &p);
-            self.menus = menu::menus(
-                self.alt_charset,
-                &self.config.recent,
-                self.spec.disks.is_some(),
-            );
+            self.rebuild_menus();
             return;
         }
         self.dropped = Some(source);
@@ -1566,10 +1597,37 @@ impl App {
         self.config.scale = scale.clamp(config::MIN_SCALE as i32, config::MAX_SCALE as i32) as u32;
     }
 
+    /// Show the `i`th system (in menu order) in this window. The document
+    /// stays as it is; it's drawn and typed in the new system's way, with
+    /// that system's own settings (colours, character set, fonts, line
+    /// warning).
+    pub fn switch_system(&mut self, i: usize) {
+        let Some(&(id, name)) = self.system_list.get(i) else {
+            return;
+        };
+        let Some(j) = self.spare.iter().position(|s| s.id == id) else {
+            return; // already showing it
+        };
+        let new = self.spare.remove(j);
+        let old = std::mem::replace(&mut self.sys, new);
+        self.spare.push(old);
+        if !self.config.switch_to(id) {
+            self.config.line_warning = self.sys.line_warning;
+        }
+        self.load_fonts();
+        self.set_charset(self.config.charset);
+        self.editor.tabs = self.sys.machine.default_tab_stops();
+        self.rebuild_menus();
+        self.message = Some(format!(
+            "{name}: {} columns",
+            self.sys.machine.screen_columns()
+        ));
+    }
+
     fn set_charset(&mut self, index: usize) {
-        let index = index % self.spec.machine.charsets().len();
-        self.spec.machine.set_charset(index);
-        self.spec.keyboard.set_charset(index);
+        let index = index % self.sys.machine.charsets().len();
+        self.sys.machine.set_charset(index);
+        self.sys.keyboard.set_charset(index);
         self.config.charset = index;
         self.charset_changed = true;
     }
@@ -1581,7 +1639,7 @@ impl App {
         let mut e = Editor::new(
             Document::from_lines(vec![codes], false),
             WrapMode::Window,
-            self.spec.machine.default_tab_stops(),
+            self.sys.machine.default_tab_stops(),
         );
         e.doc.line_end();
         e
@@ -1593,7 +1651,7 @@ impl App {
             WrapMode::Window,
             FIELD_MAX,
             1,
-            self.spec.machine.screen_columns(),
+            self.sys.machine.screen_columns(),
             0,
         )
     }
@@ -1629,7 +1687,7 @@ impl App {
 
     /// The find text for messages, with tags for Atari characters.
     fn find_label(&self) -> String {
-        self.spec.machine.export_ascii(self.find_field.doc.line(0))
+        self.sys.machine.export_ascii(self.find_field.doc.line(0))
     }
 
     /// Edit > Find (or Replace): open the panel, starting with the
@@ -1828,7 +1886,7 @@ impl App {
     /// (one line).
     fn field_clipboard(&mut self, k: Keycode, clipboard: &ClipboardUtil) {
         let layout = self.field_layout();
-        let machine = self.spec.machine.as_ref();
+        let machine = self.sys.machine.as_ref();
         let paste = (k == Keycode::V)
             .then(|| clipboard.clipboard_text().ok())
             .flatten()
@@ -1886,7 +1944,7 @@ impl App {
     pub fn test_open_find(&mut self, text: &str, layout: &Layout) {
         self.open_find(false);
         let codes = self
-            .spec
+            .sys
             .machine
             .import_text(text.as_bytes())
             .lines
@@ -2182,10 +2240,10 @@ impl App {
         }
         let name = match &self.source {
             Some(_) => self.save_name(),
-            None => with_extension_like("UNTITLED", self.spec.machine.text_format().extension()),
+            None => with_extension_like("UNTITLED", self.sys.machine.text_format().extension()),
         };
         name.chars()
-            .map(|c| self.spec.machine.ascii_code(c))
+            .map(|c| self.sys.machine.ascii_code(c))
             .collect()
     }
 
@@ -2214,7 +2272,7 @@ impl App {
     pub fn test_image_type(&mut self, text: &str) {
         let codes: Vec<u8> = text
             .chars()
-            .filter_map(|c| self.spec.machine.code_for_char(c))
+            .filter_map(|c| self.sys.machine.code_for_char(c))
             .collect();
         if let Some(p) = &mut self.image_page {
             p.type_codes(&codes);
@@ -2246,7 +2304,7 @@ impl App {
 
     /// How many character sets can have a font (at most two).
     fn font_sets(&self) -> usize {
-        self.spec.machine.charsets().len().min(2)
+        self.sys.machine.charsets().len().min(2)
     }
 
     /// At startup: load the font files chosen in the settings. One that
@@ -2261,7 +2319,7 @@ impl App {
             }
             let result = std::fs::read(&path)
                 .map_err(|e| e.to_string())
-                .and_then(|bytes| self.spec.machine.load_font(i, Some(&bytes)));
+                .and_then(|bytes| self.sys.machine.load_font(i, Some(&bytes)));
             if result.is_err() {
                 failed.push(file_label(&path));
             }
@@ -2278,14 +2336,14 @@ impl App {
     /// Use font file `path` for character set `i`, or the built-in one.
     fn set_font(&mut self, i: usize, path: Option<&Path>) {
         let Some(path) = path else {
-            let _ = self.spec.machine.load_font(i, None);
+            let _ = self.sys.machine.load_font(i, None);
             self.config.font_builtin[i] = true;
             self.charset_changed = true;
             return;
         };
         let result = std::fs::read(path)
             .map_err(|e| e.to_string())
-            .and_then(|bytes| self.spec.machine.load_font(i, Some(&bytes)));
+            .and_then(|bytes| self.sys.machine.load_font(i, Some(&bytes)));
         let name = file_label(&path.to_string_lossy());
         match result {
             Ok(()) => {
@@ -2314,7 +2372,7 @@ impl App {
 
     /// The values the Fonts page shows.
     pub fn fonts_view(&self) -> fonts_page::View {
-        let machine = self.spec.machine.as_ref();
+        let machine = self.sys.machine.as_ref();
         let names = machine.charsets();
         let sets = (0..self.font_sets())
             .map(|i| fonts_page::SetView {
@@ -2505,7 +2563,7 @@ impl App {
         let s = self.print_settings();
         let lines = self.editor.doc.lines();
         let pdf = retro_core::print::pdf(
-            self.spec.machine.as_ref(),
+            self.sys.machine.as_ref(),
             lines,
             &self.file_name(),
             self.spec.title,
@@ -2551,8 +2609,8 @@ impl App {
         self.close_menu();
         self.overlay = Overlay::None;
         let mut p = Prefs::new(
-            self.spec.colors.is_some(),
-            self.spec.colors.is_some_and(|c| c.lums > 1),
+            self.sys.colors.is_some(),
+            self.sys.colors.is_some_and(|c| c.lums > 1),
         );
         p.focus_on(focus);
         self.prefs = Some(p);
@@ -2568,12 +2626,13 @@ impl App {
     /// The values shown on the Preferences page.
     pub fn prefs_view(&self) -> prefs::View<'_> {
         prefs::View {
+            system: self.sys.machine.name(),
             native: self.config.wrap == WrapMode::Native,
-            native_label: format!("{} columns", self.spec.machine.screen_columns()),
+            native_label: format!("{} columns", self.sys.machine.screen_columns()),
             line_numbers: self.config.line_numbers,
             scale: self.config.scale,
-            charsets: self.spec.machine.charsets(),
-            charset: self.spec.machine.charset(),
+            charsets: self.sys.machine.charsets(),
+            charset: self.sys.machine.charset(),
             control_alt: self.config.control_key.alt,
             control_right: self.config.control_key.right,
             commodore_alt: self.config.commodore_key.alt,
@@ -2584,7 +2643,7 @@ impl App {
             dir_path: &self.config.default_dir,
             save_on_exit: self.config.save_on_exit,
             colors: self
-                .spec
+                .sys
                 .colors
                 .zip(self.color_choice())
                 .map(|(m, [t, b, r])| {
@@ -2605,8 +2664,8 @@ impl App {
         Some(match f {
             Field::Wrap => (usize::from(self.config.wrap == WrapMode::Window), 2),
             Field::Charset => (
-                self.spec.machine.charset(),
-                self.spec.machine.charsets().len(),
+                self.sys.machine.charset(),
+                self.sys.machine.charsets().len(),
             ),
             Field::ControlAlt => (usize::from(self.config.control_key.alt), 2),
             Field::ControlSide => (usize::from(self.config.control_key.right), 2),
@@ -2673,6 +2732,10 @@ impl App {
     /// settings) are kept.
     fn reset_prefs(&mut self) {
         let d = Config {
+            // Only this system's settings go back to their defaults.
+            system: std::mem::take(&mut self.config.system),
+            systems: std::mem::take(&mut self.config.systems),
+            line_warning: self.sys.line_warning,
             last_dir: std::mem::take(&mut self.config.last_dir),
             fonts: std::mem::take(&mut self.config.fonts),
             print_paper: self.config.print_paper,
@@ -2690,7 +2753,7 @@ impl App {
 
     /// Step a hue (wrapping round) or luminance (stopping at the ends).
     fn step_color(&mut self, f: Field, up: bool) {
-        let (Some(m), Some(colors)) = (self.spec.colors, self.color_choice()) else {
+        let (Some(m), Some(colors)) = (self.sys.colors, self.color_choice()) else {
             return;
         };
         let which = match f {
@@ -2821,11 +2884,17 @@ impl App {
         let checked = match c {
             ToggleWrap => Some(self.config.wrap == WrapMode::Native),
             ToggleLineNumbers => Some(self.config.line_numbers),
+            SelectSystem(n) => Some(
+                self.system_list
+                    .get(usize::from(n))
+                    .is_some_and(|&(id, _)| id == self.sys.id),
+            ),
             ToggleShowCodes => Some(self.config.show_codes),
             ToggleActOnCodes => Some(self.config.act_on_codes),
+            ToggleHighlightCodes => Some(self.config.highlight_codes),
             ToggleControlAlt => Some(self.config.control_key.alt),
             ToggleControlSide => Some(self.config.control_key.right),
-            ToggleCharset => Some(self.spec.machine.charset() != 0),
+            ToggleCharset => Some(self.sys.machine.charset() != 0),
             _ => None,
         };
         ItemState { enabled, checked }
@@ -2865,6 +2934,7 @@ impl App {
             FindPrevious => self.find_next(false, layout),
             GoToLine => self.open_goto(),
             OpenRecent(n) => self.open_recent(n as usize),
+            SelectSystem(n) => self.switch_system(usize::from(n)),
             RecentFiles => {}
             Quit => self.guard(After::Quit),
             Undo => {
@@ -2879,7 +2949,7 @@ impl App {
                     self.editor.cut(layout);
                 }
                 if let Some(lines) = text {
-                    let s = clipboard::to_text(&lines, self.spec.machine.as_ref());
+                    let s = clipboard::to_text(&lines, self.sys.machine.as_ref());
                     if let Err(e) = ctx.clipboard.set_clipboard_text(&s) {
                         self.message = Some(format!("Clipboard error: {e}"));
                     }
@@ -2887,13 +2957,13 @@ impl App {
             }
             Paste => match ctx.clipboard.clipboard_text() {
                 Ok(s) => {
-                    let (lines, skipped) = clipboard::from_text(&s, self.spec.machine.as_ref());
+                    let (lines, skipped) = clipboard::from_text(&s, self.sys.machine.as_ref());
                     let lines = self.keep_look_after(lines);
                     self.editor.paste(&lines, layout);
                     self.message = (skipped > 0).then(|| {
                         format!(
                             "{skipped} character(s) have no {} equivalent and were left out",
-                            self.spec.machine.name()
+                            self.sys.machine.name()
                         )
                     });
                 }
@@ -2923,6 +2993,17 @@ impl App {
                     .into(),
                 );
             }
+            ToggleHighlightCodes => {
+                self.config.highlight_codes = !self.config.highlight_codes;
+                self.message = Some(
+                    if self.config.highlight_codes {
+                        "Control codes highlighted"
+                    } else {
+                        "Control codes in their own colours"
+                    }
+                    .into(),
+                );
+            }
             ToggleActOnCodes => {
                 self.config.act_on_codes = !self.config.act_on_codes;
                 self.message = Some(
@@ -2946,8 +3027,8 @@ impl App {
                 self.message = Some(format!("CTRL key: {}", self.config.control_key.label()));
             }
             ToggleCharset => {
-                self.set_charset(self.spec.machine.charset() + 1);
-                let m = &self.spec.machine;
+                self.set_charset(self.sys.machine.charset() + 1);
+                let m = &self.sys.machine;
                 self.message = Some(format!("{} character set", m.charsets()[m.charset()]));
             }
             Preferences => self.open_prefs(Field::Wrap),
@@ -3147,7 +3228,7 @@ impl App {
         if self.image_page.is_some() {
             let codes: Vec<u8> = text
                 .chars()
-                .filter_map(|c| self.spec.machine.code_for_char(c))
+                .filter_map(|c| self.sys.machine.code_for_char(c))
                 .collect();
             if let Some(p) = &mut self.image_page {
                 p.type_codes(&codes);
@@ -3182,10 +3263,10 @@ impl App {
     /// Send a key to the machine's keyboard rules and apply the result.
     /// Returns false if the key means nothing to the machine.
     fn machine_key(&mut self, input: KeyInput, layout: &Layout) -> bool {
-        let action = self.spec.keyboard.handle(input);
+        let action = self.sys.keyboard.handle(input);
         // Typing in a Find panel field: the one-line editing keys only.
         let field_layout = self.field_layout();
-        let machine = self.spec.machine.as_ref();
+        let machine = self.sys.machine.as_ref();
         if let Some(p) = self.find.as_ref().filter(|p| p.active)
             && p.focused().is_atari()
         {
@@ -3222,7 +3303,7 @@ impl App {
             self.message = None;
         }
         self.editor
-            .apply(action, layout, self.spec.machine.as_ref(), input.mods.shift);
+            .apply(action, layout, self.sys.machine.as_ref(), input.mods.shift);
         if let Some(note) = self.editor.take_note() {
             self.message = Some(note);
         }
@@ -3313,7 +3394,7 @@ impl App {
                 && let Some(action) = word_key(k, editor_ctrl, m)
             {
                 let field_layout = self.field_layout();
-                let machine = self.spec.machine.as_ref();
+                let machine = self.sys.machine.as_ref();
                 if let Some(e) = match self.find.as_ref().map(|p| p.focused()) {
                     Some(find_page::Field::FindText) => Some(&mut self.find_field),
                     Some(find_page::Field::ReplaceText) => Some(&mut self.replace_field),
@@ -3370,7 +3451,7 @@ impl App {
             && let Some(action) = word_key(k, editor_ctrl, m)
         {
             self.editor
-                .apply(action, layout, self.spec.machine.as_ref(), shift);
+                .apply(action, layout, self.sys.machine.as_ref(), shift);
             return false;
         }
 
@@ -3412,7 +3493,7 @@ impl App {
                         EditAction::DocEnd
                     };
                     self.editor
-                        .apply(a, layout, self.spec.machine.as_ref(), shift);
+                        .apply(a, layout, self.sys.machine.as_ref(), shift);
                     None
                 }
                 // The Mac's ⌘-arrows: start and end of the line or document.
@@ -3426,7 +3507,7 @@ impl App {
                         _ => EditAction::LineEnd,
                     };
                     self.editor
-                        .apply(a, layout, self.spec.machine.as_ref(), shift);
+                        .apply(a, layout, self.sys.machine.as_ref(), shift);
                     None
                 }
                 _ => None,
@@ -3437,6 +3518,11 @@ impl App {
             return false;
         }
 
+        // Shift+F5: Highlight Codes.
+        if k == Keycode::F5 && shift && !alt && !machine_ctrl && !commodore {
+            self.command(Command::ToggleHighlightCodes, ctx);
+            return false;
+        }
         // F3 / Shift+F3: Find Next / Previous.
         if k == Keycode::F3 && !alt && !machine_ctrl {
             let c = if shift {

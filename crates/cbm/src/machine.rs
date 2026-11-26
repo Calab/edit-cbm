@@ -1,40 +1,47 @@
-//! The Commodore 64.
+//! A Commodore computer as the editor sees it: PETSCII, its character
+//! sets, its screen width and colour codes. The differences between the
+//! models are in [`crate::model`].
 
 use retro_core::{CodeEffect, Decoded, FileFormat, Machine};
 
+use crate::model::Model;
 use crate::{FORMATS, font, petscii};
 
 /// Index of the Mixed case set in [`Machine::charsets`].
 pub const MIXED_CASE: usize = 1;
 
 #[derive(Debug, Clone)]
-pub struct C64 {
+pub struct Cbm {
+    model: &'static Model,
     /// 0 = Graphics (upper case and graphics), 1 = Mixed case.
     charset: usize,
     /// The built-in character sets (placeholders, or a development ROM
-    /// given by [`C64::set_builtin_rom`]).
+    /// given by [`Cbm::set_builtin_rom`]).
     builtin: [Vec<u8>; 2],
     /// Fonts loaded from files, in place of the built-in sets.
     fonts: [Option<Vec<u8>>; 2],
 }
 
-impl Default for C64 {
-    fn default() -> Self {
+impl Cbm {
+    pub fn new(model: &'static Model) -> Self {
         Self {
+            model,
             charset: 0,
             builtin: [font::placeholder(), font::placeholder()],
             fonts: [None, None],
         }
     }
-}
 
-impl C64 {
+    pub fn model(&self) -> &'static Model {
+        self.model
+    }
+
     /// Use a character ROM (4096 bytes: Graphics then Mixed case) as the
     /// built-in sets. For development only: the ROM is Commodore's, so it
     /// is read from a file when the program starts, never built in.
     pub fn set_builtin_rom(&mut self, rom: &[u8]) -> Result<(), String> {
         if rom.len() != 4096 {
-            return Err(format!("{} bytes; a C64 character ROM is 4096", rom.len()));
+            return Err(format!("{} bytes; a character ROM is 4096", rom.len()));
         }
         for (i, set) in self.builtin.iter_mut().enumerate() {
             *set = font::set_from_rom(rom, i)?;
@@ -44,6 +51,11 @@ impl C64 {
 
     fn mixed(&self) -> bool {
         self.charset == MIXED_CASE
+    }
+
+    /// The colour codes this model has, in colour-number order.
+    fn colour_codes(&self) -> &'static [u8] {
+        &petscii::COLOUR_CODES[..self.model.colour_codes]
     }
 }
 
@@ -82,9 +94,9 @@ pub fn code_for_char(c: char, mixed: bool) -> Option<u8> {
     })
 }
 
-impl Machine for C64 {
+impl Machine for Cbm {
     fn name(&self) -> &'static str {
-        "C64"
+        self.model.name
     }
 
     fn glyph(&self, code: u8) -> [u8; 8] {
@@ -120,16 +132,18 @@ impl Machine for C64 {
     }
 
     fn screen_columns(&self) -> usize {
-        40
+        self.model.columns
     }
 
-    /// The 16 colour codes and RVS ON/OFF. Other control codes ({CLR},
-    /// cursor codes...) are only shown.
+    /// The colour codes the model has (16 on the C64, 8 on the VIC-20)
+    /// and RVS ON/OFF. Other control codes ({CLR}, cursor codes...) are
+    /// only shown.
     fn code_effect(&self, code: u8) -> Option<CodeEffect> {
         match code {
             petscii::RVS_ON => Some(CodeEffect::ReverseOn),
             petscii::RVS_OFF => Some(CodeEffect::ReverseOff),
-            _ => petscii::COLOUR_CODES
+            _ => self
+                .colour_codes()
                 .iter()
                 .position(|&c| c == code)
                 .map(|n| CodeEffect::Colour(n as u8)),
@@ -138,7 +152,7 @@ impl Machine for C64 {
 
     fn effect_code(&self, effect: CodeEffect) -> Option<u8> {
         match effect {
-            CodeEffect::Colour(n) => petscii::COLOUR_CODES.get(usize::from(n)).copied(),
+            CodeEffect::Colour(n) => self.colour_codes().get(usize::from(n)).copied(),
             CodeEffect::ReverseOn => Some(petscii::RVS_ON),
             CodeEffect::ReverseOff => Some(petscii::RVS_OFF),
         }
@@ -230,11 +244,12 @@ impl Machine for C64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model;
     use retro_core::clipboard::{from_text, to_text};
 
     #[test]
     fn clipboard_round_trips_every_code_in_both_sets() {
-        let mut m = C64::default();
+        let mut m = Cbm::new(&model::C64);
         let all: Vec<u8> = (0..=255).filter(|&c| c != petscii::CR).collect();
         for set in [0, MIXED_CASE] {
             m.set_charset(set);
@@ -245,7 +260,7 @@ mod tests {
 
     #[test]
     fn clipboard_letters() {
-        let mut m = C64::default();
+        let mut m = Cbm::new(&model::C64);
         let line = vec![0x48, 0x49, 0xC1, 0x5C];
         assert_eq!(to_text(std::slice::from_ref(&line), &m), "HI\u{E0C1}£");
         assert_eq!(from_text("hi", &m).0, vec![vec![0x48, 0x49]]);
@@ -259,7 +274,7 @@ mod tests {
         let mut rom = vec![0u8; 4096];
         rom[8..16].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // Graphics A
         rom[2048 + 8] = 0x99; // Mixed case a
-        let mut m = C64::default();
+        let mut m = Cbm::new(&model::C64);
         m.set_builtin_rom(&rom).unwrap();
         assert_eq!(m.glyph(b'A'), [1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(m.glyph(0x93), [0xFF; 8]); // CLR: reversed blank heart
@@ -275,7 +290,7 @@ mod tests {
 
     #[test]
     fn colour_codes() {
-        let m = C64::default();
+        let m = Cbm::new(&model::C64);
         assert_eq!(m.code_effect(0x90), Some(CodeEffect::Colour(0)));
         assert_eq!(m.code_effect(0x05), Some(CodeEffect::Colour(1)));
         assert_eq!(m.code_effect(0x9B), Some(CodeEffect::Colour(15)));
@@ -293,7 +308,7 @@ mod tests {
     #[test]
     fn editing_with_codes_hidden() {
         use retro_core::{Document, EditAction::*, Editor, HideRule, Pos, WrapMode};
-        let m = C64::default();
+        let m = Cbm::new(&model::C64);
         // A{RED}B"{RED}"
         let doc = Document::from_lines(vec![b"A\x1cB\"\x1c\"".to_vec()], true);
         let mut ed = Editor::new(doc, WrapMode::Native, m.default_tab_stops());
@@ -325,7 +340,7 @@ mod tests {
     #[test]
     fn tab_stops_ignore_codes_outside_quotes() {
         use retro_core::{Document, EditAction::*, Editor, Pos, WrapMode};
-        let m = C64::default();
+        let m = Cbm::new(&model::C64);
         // {RED}AB: the code doesn't count, so the first stop (column 8)
         // is 8 characters in, one byte further on.
         let doc = Document::from_lines(vec![b"\x1cAB".to_vec(), b"\"\x1c\"".to_vec()], true);
@@ -342,8 +357,17 @@ mod tests {
     }
 
     #[test]
+    fn the_vic20_has_22_columns_and_8_colour_codes() {
+        let m = Cbm::new(&model::VIC20);
+        assert_eq!((m.name(), m.screen_columns()), ("VIC-20", 22));
+        assert_eq!(m.code_effect(0x9E), Some(CodeEffect::Colour(7))); // yellow
+        assert_eq!(m.code_effect(0x81), None); // no orange code
+        assert_eq!(m.effect_code(CodeEffect::Colour(8)), None);
+    }
+
+    #[test]
     fn export_forms() {
-        let m = C64::default();
+        let m = Cbm::new(&model::C64);
         assert_eq!(m.export_standard(&[0x41, 0x93, 0x5F]), ("A?←".into(), 1));
         assert_eq!(m.export_ascii(&[0x41, 0x93, 0x5F]), "A{$93}{$5F}");
     }

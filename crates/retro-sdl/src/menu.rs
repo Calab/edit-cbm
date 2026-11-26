@@ -26,6 +26,8 @@ pub enum Command {
     RecentFiles,
     /// Open the `n`th recent file.
     OpenRecent(u8),
+    /// Show the `n`th system (in [`menus`]' list) in this window.
+    SelectSystem(u8),
     Quit,
     Undo,
     Redo,
@@ -42,6 +44,7 @@ pub enum Command {
     ToggleLineNumbers,
     ToggleShowCodes,
     ToggleActOnCodes,
+    ToggleHighlightCodes,
     ZoomIn,
     ZoomOut,
     Fonts,
@@ -116,9 +119,16 @@ const SEP: Item = Item {
 
 /// The menus. `alt_charset` names the machine's second character set, if
 /// it has one, for a toggle in the Options menu; `images` adds the disk
-/// image items to the File menu. In labels, `&` marks the hot key
-/// (underlined; pressing it chooses the item while the menu is open).
-pub fn menus(alt_charset: Option<&'static str>, recent: &[String], images: bool) -> Vec<Menu> {
+/// image items to the File menu; `systems` (id, name) fill the System
+/// menu; `columns` is the system's native width. In labels, `&` marks the hot key (underlined; pressing it chooses
+/// the item while the menu is open).
+pub fn menus(
+    alt_charset: Option<&'static str>,
+    recent: &[String],
+    images: bool,
+    systems: &[(&'static str, &'static str)],
+    columns: usize,
+) -> Vec<Menu> {
     use Command::*;
     let mut m = vec![
         Menu {
@@ -150,9 +160,13 @@ pub fn menus(alt_charset: Option<&'static str>, recent: &[String], images: bool)
         Menu {
             title: "&Options",
             items: vec![
-                item("&40 Columns", "F4", ToggleWrap),
+                Item {
+                    label: std::borrow::Cow::Owned(format!("&{columns} Columns")),
+                    ..item("", "F4", ToggleWrap)
+                },
                 item("&Line Numbers", "", ToggleLineNumbers),
                 item("Show &Codes", "F5", ToggleShowCodes),
+                item("&Highlight Codes", "Shift+F5", ToggleHighlightCodes),
                 item("Act on Co&des", "F6", ToggleActOnCodes),
                 item("Zoom &In", "Ctrl++", ZoomIn),
                 item("Zoom &Out", "Ctrl+-", ZoomOut),
@@ -173,6 +187,19 @@ pub fn menus(alt_charset: Option<&'static str>, recent: &[String], images: bool)
             ],
         },
         Menu {
+            title: "&System",
+            items: systems
+                .iter()
+                .enumerate()
+                .map(|(i, &(_, name))| Item {
+                    label: std::borrow::Cow::Owned(format!("&{name}")),
+                    shortcut: "",
+                    command: Some(SelectSystem(i as u8)),
+                    submenu: Vec::new(),
+                })
+                .collect(),
+        },
+        Menu {
             title: "&Help",
             items: vec![
                 item("&Keyboard Help", "F1", KeyHelp),
@@ -184,7 +211,7 @@ pub fn menus(alt_charset: Option<&'static str>, recent: &[String], images: bool)
         },
     ];
     if let Some(label) = alt_charset {
-        m[2].items.insert(4, item(label, "F7", ToggleCharset));
+        m[2].items.insert(5, item(label, "F7", ToggleCharset));
     }
     // Find and Go to Line, in the Edit menu only (not the right-click one).
     m[1].items.extend([

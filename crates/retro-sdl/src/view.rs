@@ -112,7 +112,7 @@ impl App {
                 (f.width, f.height),
                 self.prefs_pad,
                 cell,
-                crate::render::rgb(self.spec.palette.warning),
+                crate::render::rgb(self.sys.palette.warning),
             );
             self.image_page = Some(p);
         }
@@ -239,7 +239,7 @@ impl App {
             let code = line
                 .get(cursor)
                 .copied()
-                .unwrap_or(self.spec.machine.space());
+                .unwrap_or(self.sys.machine.space());
             grid.fill(cursor - scroll, 0, 1, c.text);
             grid.codes(cursor - scroll, 0, &[code], c.background);
         }
@@ -287,7 +287,7 @@ impl App {
         let (sel_bg, sel_fg) = (c.selection, c.selection_text);
         let layout = &f.layout;
         let doc = &self.editor.doc;
-        let machine = self.spec.machine.as_ref();
+        let machine = self.sys.machine.as_ref();
         let w = layout.text_cols;
         let warn_col = self.config.warning_column().unwrap_or(usize::MAX);
         let sel = self.editor.selection();
@@ -299,7 +299,7 @@ impl App {
             ..cur
         };
         // A character's colour: its colour code's, or the screen's.
-        let colour = |a: Attr| match (a.colour, self.spec.colors) {
+        let colour = |a: Attr| match (a.colour, self.sys.colors) {
             (Some(n), Some(m)) => crate::render::rgb((m.rgb)(n, 0)),
             _ => fg,
         };
@@ -359,8 +359,16 @@ impl App {
                         continue;
                     }
                     let look = looks[col];
-                    // Characters past the warning column use the warning colour.
-                    let ink = if col >= warn_col { warn } else { colour(look) };
+                    // Highlighted control codes stand out; otherwise
+                    // characters past the warning column use the warning
+                    // colour.
+                    let ink = if self.config.highlight_codes && machine.is_control(code) {
+                        c.codes
+                    } else if col >= warn_col {
+                        warn
+                    } else {
+                        colour(look)
+                    };
                     if look.reverse {
                         grid.fill(x, screen, 1, ink);
                         grid.codes(x, screen, &[code], bg);
@@ -392,7 +400,7 @@ impl App {
                 .line(cur.line)
                 .get(cur.col)
                 .copied()
-                .unwrap_or(self.spec.machine.space());
+                .unwrap_or(self.sys.machine.space());
             grid.fill(layout.left_margin + cx, screen, 1, fg);
             grid.codes(layout.left_margin + cx, screen, &[code], bg);
         }
@@ -426,7 +434,7 @@ impl App {
             parts.push((format!("{n} selected"), t.text));
         }
         parts.push((format!("Ln {}, Col {}", cur.line + 1, cur.col + 1), t.text));
-        for ind in self.spec.keyboard.indicators() {
+        for ind in self.sys.keyboard.indicators() {
             let label = match ind {
                 "INV" => "Inverse",
                 "ESC" => "Esc",
@@ -440,7 +448,8 @@ impl App {
         if !self.config.act_on_codes {
             parts.push(("Codes don't act".into(), t.highlight));
         }
-        let m = &self.spec.machine;
+        let m = &self.sys.machine;
+        parts.push((m.name().into(), t.text));
         // The file's type: "Atari BASIC", "ATASCII"...
         parts.push((self.format.status_name().into(), t.text));
         if m.charset() != 0 {
@@ -452,7 +461,7 @@ impl App {
         ));
         parts.push((
             match self.editor.wrap {
-                WrapMode::Native => format!("{} columns", self.spec.machine.screen_columns()),
+                WrapMode::Native => format!("{} columns", self.sys.machine.screen_columns()),
                 WrapMode::Window => "Window width".into(),
             },
             t.text,
@@ -592,8 +601,9 @@ impl App {
              F1  This keyboard help\n\
              F2  Save\n\
              F3 / Shift+F3  Find next / previous\n\
-             F4  40 columns / window width\n\
+             F4  The system's own width / window width\n\
              F5  Show / hide colour and reverse codes (outside quotes)\n\
+             Shift+F5  Highlight control codes in a colour of their own\n\
              F6  Colour and reverse codes act on the text, or not\n\
              F7  Graphics / Mixed case character set\n\
              F9  Preferences\n\
@@ -607,7 +617,7 @@ impl App {
              \n",
             self.spec.title.to_uppercase()
         );
-        for l in self.spec.help {
+        for l in self.sys.help {
             s.push_str(l);
             s.push('\n');
         }

@@ -4,6 +4,7 @@
 //! * Windows: `%APPDATA%\<app>\settings.txt`
 //! * macOS:   `~/Library/Application Support/<app>/settings.txt`
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use retro_core::WrapMode;
@@ -66,8 +67,103 @@ pub enum DirMode {
     Fixed,
 }
 
+/// The settings kept for each system: its colours, character set, fonts
+/// and line-length warning column. The current system's are in
+/// [`Config`]'s own fields; the others wait in [`Config::systems`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemConfig {
+    pub text_color: Option<(u8, u8)>,
+    pub background_color: Option<(u8, u8)>,
+    pub border_color: Option<(u8, u8)>,
+    pub charset: usize,
+    pub fonts: [String; 2],
+    pub font_builtin: [bool; 2],
+    pub line_warning: usize,
+}
+
+impl Default for SystemConfig {
+    fn default() -> Self {
+        Self {
+            text_color: None,
+            background_color: None,
+            border_color: None,
+            charset: 0,
+            fonts: Default::default(),
+            font_builtin: [true, true],
+            line_warning: DEFAULT_LINE_WARNING,
+        }
+    }
+}
+
+impl SystemConfig {
+    /// Read one `key = value` line of a system's section. Returns false if
+    /// the key isn't one of a system's.
+    fn parse_line(&mut self, k: &str, v: &str) -> bool {
+        match k {
+            // A font file means it's in use, unless the line after
+            // says built-in.
+            "font" => {
+                self.fonts[0] = v.to_string();
+                self.font_builtin[0] = v.is_empty();
+            }
+            "font_mixed" => {
+                self.fonts[1] = v.to_string();
+                self.font_builtin[1] = v.is_empty();
+            }
+            "font_builtin" => self.font_builtin[0] = v != "off",
+            "font_mixed_builtin" => self.font_builtin[1] = v != "off",
+            "line_warning" => {
+                if let Ok(n) = v.parse::<usize>() {
+                    self.line_warning = n.min(MAX_LINE_WARNING);
+                }
+            }
+            "charset" => {
+                if let Ok(n) = v.parse::<usize>() {
+                    self.charset = n.min(15);
+                }
+            }
+            "text_color" => self.text_color = parse_color(v),
+            "background_color" => self.background_color = parse_color(v),
+            "border_color" => self.border_color = parse_color(v),
+            _ => return false,
+        }
+        true
+    }
+
+    fn to_text(&self) -> String {
+        format!(
+            "# Font files (character ROMs) for the Graphics and Mixed case sets\n\
+             font = {}\n\
+             font_builtin = {}\n\
+             font_mixed = {}\n\
+             font_mixed_builtin = {}\n\
+             line_warning = {}\n\
+             # charset: 0 = Graphics, 1 = Mixed case\n\
+             charset = {}\n\
+             # Colours as number,0 (empty = the machine's default)\n\
+             text_color = {}\n\
+             background_color = {}\n\
+             border_color = {}\n",
+            self.fonts[0],
+            on_off(self.font_builtin[0]),
+            self.fonts[1],
+            on_off(self.font_builtin[1]),
+            self.line_warning,
+            self.charset,
+            color_text(self.text_color),
+            color_text(self.background_color),
+            color_text(self.border_color),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// The system last chosen (its id), which a new window starts in.
+    pub system: String,
+    /// The other systems' settings, by id. (The current system's are in
+    /// the fields below; [`Config::store`] copies them in here.)
+    pub systems: BTreeMap<String, SystemConfig>,
     /// The PC key used as the CTRL key.
     pub control_key: ControlKey,
     /// The PC key used as the Commodore (C=) key.
@@ -100,6 +196,8 @@ pub struct Config {
     pub show_codes: bool,
     /// Colour and reverse codes colour and reverse the text after them.
     pub act_on_codes: bool,
+    /// Draw control codes in a colour of their own, so they stand out.
+    pub highlight_codes: bool,
     /// The font file last loaded for each character set (empty: none
     /// yet), kept while the built-in set is in use.
     pub fonts: [String; 2],
@@ -149,6 +247,8 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            system: String::new(),
+            systems: BTreeMap::new(),
             control_key: ControlKey::DEFAULT,
             commodore_key: ControlKey::COMMODORE,
             wrap: WrapMode::Native,
@@ -166,6 +266,7 @@ impl Default for Config {
             line_numbers: false,
             show_codes: true,
             act_on_codes: true,
+            highlight_codes: false,
             fonts: Default::default(),
             font_builtin: [true, true],
             print_paper: Paper::Letter,
@@ -242,12 +343,27 @@ impl Config {
 
     pub fn parse(text: &str) -> Self {
         let mut c = Self::default();
+        // The system section being read, if any: `[c64]` starts one.
+        let mut section: Option<String> = None;
         for line in text.lines() {
+            let t = line.trim();
+            if let Some(id) = t.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                section = Some(id.trim().to_string());
+                c.systems.entry(id.trim().to_string()).or_default();
+                continue;
+            }
             let Some((k, v)) = line.split_once('=') else {
                 continue;
             };
             let v = v.trim();
+            if let Some(id) = &section {
+                let sc = c.systems.get_mut(id).expect("added at the section line");
+                if sc.parse_line(k.trim(), v) {
+                    continue;
+                }
+            }
             match k.trim() {
+                "system" => c.system = v.to_string(),
                 // Before 1.2: right_ctrl or left_alt. On a Mac right_ctrl
                 // meant the control key, which laptops have on the left.
                 "control_key" => match v {
@@ -283,19 +399,7 @@ impl Config {
                 "line_numbers" => c.line_numbers = v == "on",
                 "show_codes" => c.show_codes = v != "off",
                 "act_on_codes" => c.act_on_codes = v != "off",
-                // A font file means it's in use, unless the line after
-                // says built-in (settings from before that line existed
-                // had no other way to say so).
-                "font" => {
-                    c.fonts[0] = v.to_string();
-                    c.font_builtin[0] = v.is_empty();
-                }
-                "font_international" => {
-                    c.fonts[1] = v.to_string();
-                    c.font_builtin[1] = v.is_empty();
-                }
-                "font_builtin" => c.font_builtin[0] = v != "off",
-                "font_international_builtin" => c.font_builtin[1] = v != "off",
+                "highlight_codes" => c.highlight_codes = v == "on",
                 "wrap" => match v {
                     "native" => c.wrap = WrapMode::Native,
                     "window" => c.wrap = WrapMode::Window,
@@ -304,21 +408,6 @@ impl Config {
                 "scale" => {
                     if let Ok(n) = v.parse::<u32>() {
                         c.scale = n.clamp(MIN_SCALE, MAX_SCALE);
-                    }
-                }
-                "charset" => {
-                    if let Ok(n) = v.parse::<usize>() {
-                        c.charset = n.min(15);
-                    }
-                }
-                "line_warning" => {
-                    if let Ok(n) = v.parse::<usize>() {
-                        // Older files used 0 for "off".
-                        if n == 0 {
-                            c.line_warning_on = false;
-                        } else {
-                            c.line_warning = n.min(MAX_LINE_WARNING);
-                        }
                     }
                 }
                 "line_warning_on" => c.line_warning_on = v != "off",
@@ -330,9 +419,6 @@ impl Config {
                 "default_dir" => c.default_dir = v.to_string(),
                 "last_dir" => c.last_dir = v.to_string(),
                 "save_on_exit" => c.save_on_exit = v != "off",
-                "text_color" => c.text_color = parse_color(v),
-                "background_color" => c.background_color = parse_color(v),
-                "border_color" => c.border_color = parse_color(v),
                 "print_paper" => match v {
                     "letter" => c.print_paper = Paper::Letter,
                     "a4" => c.print_paper = Paper::A4,
@@ -358,6 +444,7 @@ impl Config {
                 _ => {}
             }
         }
+        c.load_current();
         c
     }
 
@@ -373,28 +460,18 @@ impl Config {
              # Colour and reverse codes: shown, and acting on the text\n\
              show_codes = {}\n\
              act_on_codes = {}\n\
-             # Font files (.FNT) for the standard and international sets\n\
-             font = {}\n\
-             font_builtin = {}\n\
-             font_international = {}\n\
-             font_international_builtin = {}\n\
+             # Control codes in a colour of their own\n\
+             highlight_codes = {}\n\
              # wrap: native (40 columns) | window\n\
              wrap = {}\n\
              scale = {}\n\
              # Highlight characters past line_warning\n\
              line_warning_on = {}\n\
-             line_warning = {}\n\
-             # charset: 0 = Graphics, 1 = Mixed case\n\
-             charset = {}\n\
              # dir_mode: last (folder last used) | fixed (default_dir)\n\
              dir_mode = {}\n\
              default_dir = {}\n\
              last_dir = {}\n\
              save_on_exit = {}\n\
-             # Colours as number,0 (empty = the machine's default)\n\
-             text_color = {}\n\
-             background_color = {}\n\
-             border_color = {}\n\
              # File > Print: paper letter | a4; width 40 | page; size in points\n\
              print_paper = {}\n\
              print_width = {}\n\
@@ -408,6 +485,9 @@ impl Config {
              window_size = {}\n\
              window_maximized = {}\n\
              # Recent files, most recent first\n\
+             {}\
+             # The system a new window starts in, then each system's own settings\n\
+             system = {}\n\
              {}",
             if self.control_key.alt { "alt" } else { "ctrl" },
             if self.control_key.right {
@@ -428,18 +508,13 @@ impl Config {
             on_off(self.line_numbers),
             on_off(self.show_codes),
             on_off(self.act_on_codes),
-            self.fonts[0],
-            on_off(self.font_builtin[0]),
-            self.fonts[1],
-            on_off(self.font_builtin[1]),
+            on_off(self.highlight_codes),
             match self.wrap {
                 WrapMode::Native => "native",
                 WrapMode::Window => "window",
             },
             self.scale,
             on_off(self.line_warning_on),
-            self.line_warning,
-            self.charset,
             match self.dir_mode {
                 DirMode::Last => "last",
                 DirMode::Fixed => "fixed",
@@ -447,9 +522,6 @@ impl Config {
             self.default_dir,
             self.last_dir,
             on_off(self.save_on_exit),
-            color_text(self.text_color),
-            color_text(self.background_color),
-            color_text(self.border_color),
             match self.print_paper {
                 Paper::Letter => "letter",
                 Paper::A4 => "a4",
@@ -468,7 +540,63 @@ impl Config {
                 .iter()
                 .map(|p| format!("recent = {p}\n"))
                 .collect::<String>(),
+            self.system,
+            self.with_current_stored()
+                .systems
+                .iter()
+                .map(|(id, sc)| format!("\n[{id}]\n{}", sc.to_text()))
+                .collect::<String>(),
         )
+    }
+
+    /// The current system's settings, from the fields that hold them.
+    pub fn current(&self) -> SystemConfig {
+        SystemConfig {
+            text_color: self.text_color,
+            background_color: self.background_color,
+            border_color: self.border_color,
+            charset: self.charset,
+            fonts: self.fonts.clone(),
+            font_builtin: self.font_builtin,
+            line_warning: self.line_warning,
+        }
+    }
+
+    /// Copy the current system's settings into [`Config::systems`].
+    pub fn store(&mut self) {
+        if !self.system.is_empty() {
+            self.systems.insert(self.system.clone(), self.current());
+        }
+    }
+
+    fn with_current_stored(&self) -> Config {
+        let mut c = self.clone();
+        c.store();
+        c
+    }
+
+    /// Put system `id`'s settings in the fields that hold the current
+    /// system's (defaults if it has none yet). Returns whether it had any.
+    fn load_current(&mut self) -> bool {
+        let saved = self.systems.get(&self.system).cloned();
+        let had = saved.is_some();
+        let sc = saved.unwrap_or_default();
+        self.text_color = sc.text_color;
+        self.background_color = sc.background_color;
+        self.border_color = sc.border_color;
+        self.charset = sc.charset;
+        self.fonts = sc.fonts;
+        self.font_builtin = sc.font_builtin;
+        self.line_warning = sc.line_warning;
+        had
+    }
+
+    /// Change to system `id`: keep the current system's settings, then
+    /// load `id`'s. Returns whether `id` had settings saved.
+    pub fn switch_to(&mut self, id: &str) -> bool {
+        self.store();
+        self.system = id.to_string();
+        self.load_current()
     }
 
     /// The settings to write for a window that started with `initial` and
@@ -478,28 +606,36 @@ impl Config {
     /// most recent first; they go before the others in the recent list.
     /// The window size is always this window's: the last one closed wins.
     pub fn merged(&self, initial: &Config, on_disk: Config, opened: &[String]) -> Config {
+        // Compare whole systems' settings, wherever they're held.
+        let me = self.with_current_stored();
+        let initial = initial.with_current_stored();
         let mut out = on_disk;
-        // Every field, so a new one can't be forgotten here.
+        out.store();
+        // Every field, so a new one can't be forgotten here. The current
+        // system's settings are compared in `systems`.
         let Config {
+            system,
+            systems,
             control_key,
             commodore_key,
             wrap,
             scale,
             line_warning_on,
-            line_warning,
-            charset,
+            line_warning: _,
+            charset: _,
             dir_mode,
             default_dir,
             last_dir,
             save_on_exit,
-            text_color,
-            background_color,
-            border_color,
+            text_color: _,
+            background_color: _,
+            border_color: _,
             line_numbers,
             show_codes,
             act_on_codes,
-            fonts,
-            font_builtin,
+            highlight_codes,
+            fonts: _,
+            font_builtin: _,
             print_paper,
             print_fill,
             print_size,
@@ -510,7 +646,7 @@ impl Config {
             recent: _,
             window_size,
             window_maximized,
-        } = self;
+        } = &me;
         macro_rules! changed {
             ($($f:ident),*) => {
                 $(if *$f != initial.$f {
@@ -519,25 +655,20 @@ impl Config {
             };
         }
         changed!(
+            system,
             control_key,
             commodore_key,
             wrap,
             scale,
             line_warning_on,
-            line_warning,
-            charset,
             dir_mode,
             default_dir,
             last_dir,
             save_on_exit,
-            text_color,
-            background_color,
-            border_color,
             line_numbers,
             show_codes,
             act_on_codes,
-            fonts,
-            font_builtin,
+            highlight_codes,
             print_paper,
             print_fill,
             print_size,
@@ -546,6 +677,11 @@ impl Config {
             print_line_numbers,
             goto_editor_line
         );
+        for (id, sc) in systems {
+            if initial.systems.get(id) != Some(sc) {
+                out.systems.insert(id.clone(), sc.clone());
+            }
+        }
         let mut recent: Vec<String> = opened.to_vec();
         for p in std::mem::take(&mut out.recent) {
             if !recent.contains(&p) {
@@ -556,6 +692,7 @@ impl Config {
         out.recent = recent;
         out.window_size = *window_size;
         out.window_maximized = *window_maximized;
+        out.load_current();
         out
     }
 
@@ -579,6 +716,15 @@ mod tests {
     #[test]
     fn round_trips() {
         let c = Config {
+            system: "vic20".into(),
+            systems: BTreeMap::from([(
+                "c64".to_string(),
+                SystemConfig {
+                    text_color: Some((1, 0)),
+                    charset: 1,
+                    ..SystemConfig::default()
+                },
+            )]),
             control_key: ControlKey {
                 alt: true,
                 right: true,
@@ -590,6 +736,7 @@ mod tests {
             line_numbers: true,
             show_codes: false,
             act_on_codes: false,
+            highlight_codes: true,
             fonts: ["/home/me/BIG.FNT".into(), "/home/me/X.FNT".into()],
             font_builtin: [false, true],
             wrap: WrapMode::Window,
@@ -615,7 +762,48 @@ mod tests {
             window_size: Some((1280, 800)),
             window_maximized: true,
         };
-        assert_eq!(Config::parse(&c.to_text()), c);
+        // The current system's settings come back in their own section.
+        let back = Config::parse(&c.to_text());
+        assert_eq!(back, c.with_current_stored());
+        assert_eq!(back.systems.len(), 2);
+        assert_eq!(back.text_color, Some((12, 7)));
+    }
+
+    #[test]
+    fn each_system_keeps_its_own_settings() {
+        let mut c = Config::default();
+        assert!(!c.switch_to("c64"));
+        c.text_color = Some((1, 0));
+        c.charset = 1;
+        // The VIC-20 has none yet: defaults.
+        assert!(!c.switch_to("vic20"));
+        assert_eq!((c.text_color, c.charset), (None, 0));
+        c.border_color = Some((3, 0));
+        // Back to the C64: its own again.
+        assert!(c.switch_to("c64"));
+        assert_eq!(
+            (c.text_color, c.charset, c.border_color),
+            (Some((1, 0)), 1, None)
+        );
+        assert_eq!(c.systems["vic20"].border_color, Some((3, 0)));
+    }
+
+    #[test]
+    fn merging_keeps_each_systems_changes() {
+        let mut initial = Config::default();
+        initial.switch_to("c64");
+        // Another window, in VIC-20 mode, changed the VIC-20's text colour.
+        let mut on_disk = initial.clone();
+        on_disk.switch_to("vic20");
+        on_disk.text_color = Some((2, 0));
+        on_disk.switch_to("c64");
+        let on_disk = Config::parse(&on_disk.to_text());
+        // This window changed the C64's.
+        let mut mine = initial.clone();
+        mine.text_color = Some((5, 0));
+        let m = mine.merged(&initial, on_disk, &[]);
+        assert_eq!(m.text_color, Some((5, 0)));
+        assert_eq!(m.systems["vic20"].text_color, Some((2, 0)));
     }
 
     #[test]
@@ -696,12 +884,6 @@ mod tests {
     }
 
     #[test]
-    fn older_font_settings_mean_in_use() {
-        let c = Config::parse("font = /f/BIG.FNT");
-        assert_eq!(c.font_builtin, [false, true]);
-    }
-
-    #[test]
     fn defaults() {
         let c = Config::default();
         // Printing: Letter, page width, 12 point, header, open after saving.
@@ -735,13 +917,5 @@ mod tests {
         let c = Config::parse("control_key = shift\nscale = 99\nnonsense");
         assert_eq!(c.control_key, ControlKey::DEFAULT);
         assert_eq!(c.scale, MAX_SCALE);
-    }
-
-    #[test]
-    fn old_zero_warning_means_off() {
-        let c = Config::parse("line_warning = 0");
-        assert!(!c.line_warning_on);
-        assert_eq!(c.line_warning, DEFAULT_LINE_WARNING);
-        assert_eq!(c.warning_column(), None);
     }
 }

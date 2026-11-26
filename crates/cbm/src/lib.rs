@@ -1,13 +1,15 @@
-//! Commodore support: PETSCII, the character sets, the systems (the C64
-//! so far), their colours and keyboard.
+//! Commodore support: PETSCII, the character sets, the models (C64,
+//! VIC-20), their colours and keyboard.
 
-pub mod c64;
 pub mod font;
 pub mod keyboard;
+pub mod machine;
+pub mod model;
 pub mod palette;
 pub mod petscii;
 
-pub use c64::C64;
+pub use machine::Cbm;
+pub use model::Model;
 
 use retro_core::FileFormat;
 

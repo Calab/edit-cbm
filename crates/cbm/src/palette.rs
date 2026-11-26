@@ -1,15 +1,15 @@
-//! The C64's 16 colours (the VIC-II palette, Colodore values).
+//! The colours of each model, as VICE's Colodore palettes give them.
 //!
-//! For the Preferences colour picker these are 16 "hues" with a single
-//! luminance each: hue = the colour number the C64 uses (`POKE 53281,6`),
-//! luminance always 0.
+//! For the Preferences colour picker these are "hues" with a single
+//! luminance each: hue = the colour number the machine uses (`POKE
+//! 53281,6` on the C64), luminance always 0. Each model has its own `rgb`
+//! and `label` functions, as the picker takes plain functions.
 
-/// Number of colours, and of luminance levels per colour.
-pub const HUES: u8 = 16;
-pub const LUMS: u8 = 1;
+/// A colour's name and RGB.
+pub type Colour = (&'static str, (u8, u8, u8));
 
-/// The colours in C64 order: name and RGB.
-pub const COLOURS: [(&str, (u8, u8, u8)); 16] = [
+/// The C64's 16 colours (the VIC-II).
+pub const C64: [Colour; 16] = [
     ("Black", (0x00, 0x00, 0x00)),
     ("White", (0xFF, 0xFF, 0xFF)),
     ("Red", (0x81, 0x33, 0x38)),
@@ -28,23 +28,51 @@ pub const COLOURS: [(&str, (u8, u8, u8)); 16] = [
     ("Light grey", (0xB2, 0xB2, 0xB2)),
 ];
 
-pub const BLUE: u8 = 6;
-pub const LIGHT_BLUE: u8 = 14;
+/// The VIC-20's 16 colours (the VIC chip; VICE's `colodore_vic.vpl`).
+/// Characters and the border use the first 8; the screen any of them.
+pub const VIC20: [Colour; 16] = [
+    ("Black", (0x00, 0x00, 0x00)),
+    ("White", (0xFF, 0xFF, 0xFF)),
+    ("Red", (0x6D, 0x23, 0x27)),
+    ("Cyan", (0xA0, 0xFE, 0xF8)),
+    ("Purple", (0x8E, 0x3C, 0x97)),
+    ("Green", (0x7E, 0xDA, 0x75)),
+    ("Blue", (0x25, 0x23, 0x90)),
+    ("Yellow", (0xFF, 0xFF, 0x86)),
+    ("Orange", (0xA4, 0x64, 0x3B)),
+    ("Light orange", (0xFF, 0xC8, 0xA1)),
+    ("Pink", (0xF2, 0xA7, 0xAB)),
+    ("Light cyan", (0xDB, 0xFF, 0xFF)),
+    ("Light purple", (0xFF, 0xB4, 0xFF)),
+    ("Light green", (0xD7, 0xFF, 0xCE)),
+    ("Light blue", (0x9D, 0x9A, 0xFF)),
+    ("Light yellow", (0xFF, 0xFF, 0xC9)),
+];
 
-/// The screen at power-on: light blue text on blue, light blue border.
-pub const DEFAULT_TEXT: (u8, u8) = (LIGHT_BLUE, 0);
-pub const DEFAULT_BACKGROUND: (u8, u8) = (BLUE, 0);
-pub const BORDER: (u8, u8) = (LIGHT_BLUE, 0);
-
-/// RGB for a colour number (0-15); the luminance is ignored.
-pub fn rgb(colour: u8, _lum: u8) -> (u8, u8, u8) {
-    COLOURS[usize::from(colour.min(HUES - 1))].1
+fn rgb(table: &[Colour], colour: u8) -> (u8, u8, u8) {
+    table[usize::from(colour).min(table.len() - 1)].1
 }
 
 /// The colour's name and number, e.g. "Blue (6)".
-pub fn label(colour: u8, _lum: u8) -> String {
-    let c = colour.min(HUES - 1);
-    format!("{} ({c})", COLOURS[usize::from(c)].0)
+fn label(table: &[Colour], colour: u8) -> String {
+    let c = usize::from(colour).min(table.len() - 1);
+    format!("{} ({c})", table[c].0)
+}
+
+pub fn c64_rgb(colour: u8, _lum: u8) -> (u8, u8, u8) {
+    rgb(&C64, colour)
+}
+
+pub fn c64_label(colour: u8, _lum: u8) -> String {
+    label(&C64, colour)
+}
+
+pub fn vic20_rgb(colour: u8, _lum: u8) -> (u8, u8, u8) {
+    rgb(&VIC20, colour)
+}
+
+pub fn vic20_label(colour: u8, _lum: u8) -> String {
+    label(&VIC20, colour)
 }
 
 #[cfg(test)]
@@ -52,9 +80,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn power_on_colours() {
-        assert_eq!(rgb(DEFAULT_BACKGROUND.0, 0), (0x2E, 0x2C, 0x9B));
-        assert_eq!(rgb(DEFAULT_TEXT.0, 0), (0x70, 0x6D, 0xEB));
-        assert_eq!(label(6, 0), "Blue (6)");
+    fn colours() {
+        assert_eq!(c64_rgb(6, 0), (0x2E, 0x2C, 0x9B));
+        assert_eq!(c64_label(6, 0), "Blue (6)");
+        assert_eq!(vic20_rgb(3, 0), (0xA0, 0xFE, 0xF8));
+        assert_eq!(vic20_label(15, 0), "Light yellow (15)");
     }
 }

@@ -8,9 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use cbm::{C64, keyboard::CbmKeyboard, palette};
+use cbm::{Cbm, Model, keyboard::CbmKeyboard, model};
 use retro_sdl::{
-    AppSpec,
+    AppSpec, System,
     render::{ColorModel, Palette},
 };
 
@@ -35,7 +35,7 @@ const FILE_TYPES: &[&str] = &[
     "Commodore equivalent become ?.",
 ];
 
-const HELP: &[&str] = &[
+const C64_HELP: &[&str] = &[
     "C64 KEYS",
     "",
     "CTRL is right Ctrl and C= is left Alt; either can",
@@ -82,6 +82,23 @@ const HELP: &[&str] = &[
     "",
     "F7 switches between the Graphics and Mixed case",
     "character sets, as Shift+C= does on the C64.",
+];
+
+/// The VIC-20 for now: the C64's keys (its own come in a later step).
+const VIC20_HELP: &[&str] = &[
+    "VIC-20 KEYS",
+    "",
+    "For now the VIC-20 uses the C64's keys (see",
+    "System > C64, then this help). Its own keyboard",
+    "comes later.",
+    "",
+    "CTRL+1 to 8     Colours: BLK WHT RED CYN PUR",
+    "                GRN BLU YEL (the VIC-20 has",
+    "                no others for text)",
+    "CTRL+9 and 0    RVS ON, RVS OFF",
+    "",
+    "F7 switches between the Graphics and Mixed case",
+    "character sets, as Shift+C= does on the VIC-20.",
 ];
 
 /// Copyright notice details, for About and Licensing.
@@ -180,56 +197,70 @@ fn dev_fonts_dir() -> Option<PathBuf> {
         .find(|d| d.is_dir())
 }
 
-/// For development until Edit CBM has fonts of its own: the C64's
-/// character ROM, copied from VICE into `fonts-dev/c64-chargen.bin`
-/// (never committed, never built in). Without it the placeholder boxes
-/// are drawn.
-fn load_dev_fonts(c64: &mut C64) {
-    let Some(rom) = dev_fonts_dir().and_then(|d| std::fs::read(d.join("c64-chargen.bin")).ok())
-    else {
+/// For development until Edit CBM has fonts of its own: the model's
+/// character ROM, copied from VICE into `fonts-dev` (never committed,
+/// never built in). Without it the placeholder boxes are drawn.
+fn load_dev_fonts(m: &mut Cbm) {
+    let file = m.model().rom_file;
+    let Some(rom) = dev_fonts_dir().and_then(|d| std::fs::read(d.join(file)).ok()) else {
         return;
     };
-    if let Err(e) = c64.set_builtin_rom(&rom) {
+    if let Err(e) = m.set_builtin_rom(&rom) {
         eprintln!(
             "edit-cbm: {}: {e}",
-            Path::new(DEV_FONTS).join("c64-chargen.bin").display()
+            Path::new(DEV_FONTS).join(file).display()
         );
+    }
+}
+
+/// The editor's system for a Commodore model.
+fn system(model: &'static Model, help: &'static [&'static str]) -> System {
+    let mut machine = Cbm::new(model);
+    load_dev_fonts(&mut machine);
+    let rgb = model.rgb;
+    let c = |n: u8| (n, 0);
+    System {
+        id: model.id,
+        machine: Box::new(machine),
+        keyboard: Box::new(CbmKeyboard::new()),
+        // The model's screen at power-on.
+        palette: Palette {
+            background: rgb(model.background, 0),
+            foreground: rgb(model.text, 0),
+            border: rgb(model.border, 0),
+            warning: (0xFF, 0xA8, 0x40),
+            selection: (0xF2, 0xC8, 0x4B),
+            selection_text: (0x10, 0x1C, 0x40),
+            // Magenta: in neither the C64's palette nor the VIC-20's.
+            codes: (0xFF, 0x00, 0xFF),
+        },
+        colors: Some(ColorModel {
+            hues: model.colours.len() as u8,
+            lums: 1,
+            lum_step: 1,
+            rgb,
+            label: model.label,
+            default_text: c(model.text),
+            default_background: c(model.background),
+            default_border: c(model.border),
+        }),
+        help,
+        line_warning: model.logical_line,
     }
 }
 
 fn main() -> ExitCode {
     let file = std::env::args_os().nth(1).map(PathBuf::from);
-    let mut c64 = C64::default();
-    load_dev_fonts(&mut c64);
-    let rgb = |c: (u8, u8)| palette::rgb(c.0, c.1);
     let spec = AppSpec {
         title: "Edit CBM",
         app_id: "edit-cbm",
-        machine: Box::new(c64),
+        systems: vec![
+            system(&model::C64, C64_HELP),
+            system(&model::VIC20, VIC20_HELP),
+        ],
         disks: None,
-        keyboard: Box::new(CbmKeyboard::new()),
-        // The C64 at power-on: light blue on blue, light blue border.
-        palette: Palette {
-            background: rgb(palette::DEFAULT_BACKGROUND),
-            foreground: rgb(palette::DEFAULT_TEXT),
-            border: rgb(palette::BORDER),
-            warning: (0xFF, 0xA8, 0x40),
-            selection: (0xF2, 0xC8, 0x4B),
-            selection_text: (0x10, 0x1C, 0x40),
-        },
         icon: b'C',
         file_types: OPEN_FILTERS,
-        colors: Some(ColorModel {
-            hues: palette::HUES,
-            lums: palette::LUMS,
-            lum_step: 1,
-            rgb: palette::rgb,
-            label: palette::label,
-            default_text: palette::DEFAULT_TEXT,
-            default_background: palette::DEFAULT_BACKGROUND,
-            default_border: palette::BORDER,
-        }),
-        help: HELP,
         file_types_help: FILE_TYPES,
         about: about(),
         licensing: licensing(),

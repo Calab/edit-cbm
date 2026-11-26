@@ -72,6 +72,9 @@ use crate::widgets::Ui;
 
 /// The values the page shows.
 pub struct View<'a> {
+    /// The window's system, e.g. "C64": colours, character set and line
+    /// warning are its own.
+    pub system: &'a str,
     pub native: bool,
     pub native_label: String,
     pub line_numbers: bool,
@@ -171,7 +174,8 @@ impl Prefs {
         canvas.set_draw_color(t.border);
         let _ = canvas.draw_line((x0, y0 + title_h), (x0 + w - 1, y0 + title_h));
         let _ = canvas.draw_rect(frame);
-        font.draw(canvas, x0 + pad * 4, y0 + pad, "Preferences", t.text);
+        let title = format!("Preferences ({})", v.system);
+        font.draw(canvas, x0 + pad * 4, y0 + pad, &title, t.text);
 
         self.hits.clear();
         let focused = self.focused();
