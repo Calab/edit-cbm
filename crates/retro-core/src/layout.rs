@@ -14,8 +14,8 @@ pub enum WrapMode {
     Window,
 }
 
-/// Which codes take no room on screen when codes are hidden: the codes
-/// that act on the text (colour and reverse), except between quotes.
+/// Which codes take no room on screen when codes are hidden: control
+/// codes, except between quotes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HideRule {
     /// A bit per code.
@@ -33,10 +33,11 @@ impl HideRule {
         Self { codes: bits, quote }
     }
 
-    /// The codes `machine` says act on the text.
+    /// Every control code `machine` has, whether or not it acts on the
+    /// text (and every code that acts, if any isn't a control code).
     pub fn for_machine(machine: &dyn crate::Machine) -> Self {
         Self::new(
-            (0..=255).filter(|&c| machine.code_effect(c).is_some()),
+            (0..=255).filter(|&c| machine.is_control(c) || machine.code_effect(c).is_some()),
             machine.quote_code(),
         )
     }

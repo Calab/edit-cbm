@@ -3211,9 +3211,9 @@ impl App {
                 self.config.show_codes = !self.config.show_codes;
                 self.message = Some(
                     if self.config.show_codes {
-                        "Colour and reverse codes shown"
+                        "Control codes shown"
                     } else {
-                        "Colour and reverse codes hidden (except in quotes)"
+                        "Control codes hidden (except in quotes)"
                     }
                     .into(),
                 );

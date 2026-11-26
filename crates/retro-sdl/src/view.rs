@@ -616,7 +616,7 @@ impl App {
              F2  Save\n\
              F3 / Shift+F3  Find next / previous\n\
              F4  The system's own width / window width\n\
-             F5  Show / hide colour and reverse codes (outside quotes)\n\
+             F5  Show / hide control codes (outside quotes)\n\
              Shift+F5  Highlight control codes in a colour of their own\n\
              F6  Colour and reverse codes act on the text, or not\n\
              F7 or Shift+C=  Graphics / Mixed case character set\n\

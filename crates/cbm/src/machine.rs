@@ -476,6 +476,17 @@ mod tests {
     }
 
     #[test]
+    fn every_control_code_hides() {
+        use retro_core::HideRule;
+        // {CLR}, and CTRL+B, which does nothing on the C64; not in quotes.
+        let rule = HideRule::for_machine(&Cbm::new(&model::C64));
+        assert_eq!(
+            rule.mask(b"\x93A\x02\"\x93\""),
+            [true, false, true, false, false, false]
+        );
+    }
+
+    #[test]
     fn export_forms() {
         let m = Cbm::new(&model::C64);
         assert_eq!(m.export_standard(&[0x41, 0x93, 0x5F]), ("A?←".into(), 1));

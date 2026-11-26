@@ -191,8 +191,8 @@ pub struct Config {
     /// Flash the cursor (the Atari's doesn't).
     /// Show editor line numbers in a column left of the text.
     pub line_numbers: bool,
-    /// Show the codes that act on the text (colour, reverse) outside
-    /// quotes; when off they take no room on screen.
+    /// Show control codes outside quotes; when off they take no room on
+    /// screen.
     pub show_codes: bool,
     /// Colour and reverse codes colour and reverse the text after them.
     pub act_on_codes: bool,
