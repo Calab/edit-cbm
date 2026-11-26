@@ -30,6 +30,14 @@ use sdl2::mouse::MouseButton;
 pub use config::{Config, ControlKey};
 use render::{ColorModel, Palette};
 
+/// The narrowest window: a 40-column screen and its border, in 8-pixel
+/// cells (shown at zoom 2).
+const MIN_COLS: u32 = 44;
+
+/// The shortest window, in desktop pixels (less if the display is
+/// smaller).
+const MIN_HEIGHT: u32 = 600;
+
 /// The window icon: the icon character filling 64x64 pixels, as the
 /// icon files in `assets/icons` are drawn.
 fn window_icon(sys: &System, icon: u8) -> Option<sdl2::surface::Surface<'static>> {
@@ -113,7 +121,14 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
 
     // The window opens small; its real size is set below, once the
     // display's pixel density is known.
-    let native_cols = app.sys.machine.screen_columns() as u32 + 4;
+    // The machine's screen in 8-pixel cells, with a border of 2 each side
+    // (an 80-column screen's characters are half as wide).
+    let cols = app.sys.machine.screen_columns() as u32;
+    let native_cols = if app.sys.machine.narrow_pixels() {
+        cols / 2
+    } else {
+        cols
+    } + 4;
     let native_rows = 24 + 5;
     let mut window = video
         .window(app.spec.title, native_cols * 8, native_rows * 8)
@@ -189,13 +204,13 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
             }
         }
 
-        let bars = app.bar_height as u32 * 2;
-        let (min_w, min_h) = fit(
-            to_window(native_cols * 16 + numbers(on, 16)),
-            to_window(24 * 16 + bars),
-        );
+        // The smallest window: a 40-column screen at zoom 2 (whatever the
+        // system, since a window can switch), and tall enough for the
+        // Image Manager and help pages to show a fair number of lines.
+        let (min_w, min_h) = fit(to_window(MIN_COLS * 16 + numbers(on, 16)), MIN_HEIGHT);
         let _ = canvas.window_mut().set_minimum_size(min_w, min_h);
 
+        let bars = app.bar_height as u32 * 2;
         let (pw, ph) = prefs::page_size(&mut small, app.prefs_pad, &app.prefs_view());
         let page = (
             to_window((pw + app.pad * 8) as u32),
@@ -584,7 +599,7 @@ pub fn run(spec: AppSpec, file: Option<PathBuf>) -> Result<(), String> {
             let (_, min_h) = canvas.window().minimum_size();
             let _ = canvas
                 .window_mut()
-                .set_minimum_size(to_window(native_cols * 16 + gutter_min), min_h);
+                .set_minimum_size(to_window(MIN_COLS * 16 + gutter_min), min_h);
         }
         let frame = app.frame(canvas.output_size()?);
         app.draw(
