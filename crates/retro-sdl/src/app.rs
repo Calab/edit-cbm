@@ -158,6 +158,8 @@ pub struct Ctx<'a> {
 
 pub struct App {
     pub spec: AppSpec,
+    /// The file type Save to Image chose for the save in progress.
+    image_file_type: Option<&'static str>,
     /// The system this window shows.
     pub sys: System,
     /// The other systems, to switch to.
@@ -298,6 +300,7 @@ impl App {
         );
         Self {
             spec,
+            image_file_type: None,
             sys,
             spare,
             system_list,
@@ -575,6 +578,19 @@ impl App {
         }
     }
 
+    /// The text format, for a file in an image whose type says it's data
+    /// rather than a program (anything but PRG, on disks with types).
+    fn data_file_in_image(&self, source: &Source) -> Option<&'static dyn FileFormat> {
+        let Source::Image { image, path } = source else {
+            return None;
+        };
+        let vol = self.open_image(image).ok()?;
+        let (name, dir) = path.split_last()?;
+        let entry = vol.list(dir).ok()?.into_iter().find(|e| e.name == *name)?;
+        let kind = entry.kind.trim_matches(['*', '<']);
+        (!kind.is_empty() && kind != "PRG").then(|| self.sys.machine.text_format())
+    }
+
     /// Read and open a disk image file.
     fn open_image(&self, image: &Path) -> Result<Box<dyn DiskVolume>, SourceError> {
         let Some(disks) = &self.spec.disks else {
@@ -590,18 +606,35 @@ impl App {
     /// afresh, write the file into it (replacing one already there only
     /// if `replace`), then save the whole image. On any error nothing is
     /// changed.
+    /// `kind` is the file type the document's format saves as (PRG,
+    /// SEQ), on disks whose files have types: used unless Save to Image
+    /// chose one, or the file is already there with its own.
     fn write_source(
         &self,
         source: &Source,
         bytes: &[u8],
         replace: bool,
+        kind: &str,
     ) -> Result<(), SourceError> {
         match source {
             Source::File(p) => write_atomically(p, bytes).map_err(SourceError::Io),
             Source::Image { image, path } => {
+                writable_image(image)?;
                 let mut vol = self.open_image(image)?;
+                let types = vol.file_types();
+                let existing = path.split_last().and_then(|(name, dir)| {
+                    let list = vol.list(dir).ok()?;
+                    let e = list.into_iter().find(|e| e.name == *name)?;
+                    Some(e.kind.trim_matches(['*', '<']).to_string())
+                });
+                let want = self
+                    .image_file_type
+                    .map(str::to_string)
+                    .or(existing)
+                    .unwrap_or_else(|| kind.to_string());
+                let file_type = types.iter().position(|&t| t == want).unwrap_or(0);
                 // Dated now, on disks that keep dates.
-                vol.write(path, bytes, replace, local_time::now())
+                vol.write(path, bytes, replace, local_time::now(), file_type)
                     .map_err(SourceError::Disk)?;
                 write_atomically(image, &vol.to_bytes()).map_err(SourceError::Io)
             }
@@ -611,6 +644,9 @@ impl App {
     /// Open a document, in `forced` format if given, otherwise the format
     /// `format::detect` picks.
     fn open_source_as(&mut self, source: Source, forced: Option<&'static dyn FileFormat>) {
+        // In an image, a file whose type says it's data (SEQ, USR, REL)
+        // is text; a program's contents decide.
+        let forced = forced.or_else(|| self.data_file_in_image(&source));
         match self.read_source(&source) {
             Ok(bytes) => {
                 let ext = source.extension();
@@ -1216,7 +1252,12 @@ impl App {
             self.pending_save = Some(save);
             return;
         }
-        match self.write_source(&save.target, &encoded.bytes, save.replace) {
+        match self.write_source(
+            &save.target,
+            &encoded.bytes,
+            save.replace,
+            save.format.disk_file_type(),
+        ) {
             Ok(()) => {}
             Err(SourceError::Io(e)) => {
                 self.message = Some(format!("Save failed: {e}"));
@@ -1243,6 +1284,7 @@ impl App {
             }
         }
         self.format = save.format;
+        self.image_file_type = None;
         self.editor.doc.mark_saved();
         self.note_folder(save.target.host());
         self.disk_stamp = Self::stamp(save.target.host());
@@ -2206,6 +2248,10 @@ impl App {
                     .as_ref()
                     .map_or(b"/".to_vec(), |d| d.top_directory().to_vec());
                 p.load(image.clone(), vol, top);
+                if writable_image(&image).is_err() {
+                    p.set_write_protected();
+                }
+                p.set_file_type(self.format.disk_file_type());
                 if let Some(Source::Image { image: own, path }) = &self.source
                     && *own == image
                     && let Some((name, dir)) = path.split_last()
@@ -2225,7 +2271,10 @@ impl App {
         use image_page::Action as A;
         match action {
             A::None => {}
-            A::Close => self.image_page = None,
+            A::Close => {
+                self.image_page = None;
+                self.image_file_type = None;
+            }
             A::Choose => self.start_file_job(FileJobKind::ChooseImage),
             A::MakeDir => self.make_image_dir(),
             A::OpenNewImage => {
@@ -2237,6 +2286,7 @@ impl App {
             A::Save => {
                 let Some(p) = &self.image_page else { return };
                 let Some(image) = p.image.clone() else { return };
+                self.image_file_type = p.chosen_file_type();
                 let target = Source::Image {
                     image,
                     path: p.path_of(&p.name),
@@ -2374,11 +2424,14 @@ impl App {
             return;
         };
         let path = p.path_of(&pop.name);
-        let done = self.open_image(&image).and_then(|mut vol| {
-            vol.make_dir(&path, local_time::now())
-                .map_err(SourceError::Disk)?;
-            write_atomically(&image, &vol.to_bytes()).map_err(SourceError::Io)
-        });
+        let size = p.new_dir_size();
+        let done = writable_image(&image)
+            .and_then(|()| self.open_image(&image))
+            .and_then(|mut vol| {
+                vol.make_dir(&path, local_time::now(), size)
+                    .map_err(SourceError::Disk)?;
+                write_atomically(&image, &vol.to_bytes()).map_err(SourceError::Io)
+            });
         if let Err(e) = done {
             if let Some(pop) = self.image_page.as_mut().and_then(|p| p.new_dir.as_mut()) {
                 pop.error = Some(sentence(&e.to_string()));
@@ -4150,6 +4203,18 @@ fn open_in_viewer(path: &Path) -> std::io::Result<()> {
         let _ = child.wait();
     });
     Ok(())
+}
+
+/// An image file the PC won't let us change (read-only) counts as
+/// write-protected: it's never written.
+fn writable_image(image: &Path) -> Result<(), SourceError> {
+    match std::fs::metadata(image) {
+        Ok(m) if m.permissions().readonly() => Err(SourceError::Disk(DiskError::new(
+            DiskErrorKind::WriteProtected,
+            "the image file is read-only, so it's treated as write-protected",
+        ))),
+        _ => Ok(()),
+    }
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

@@ -5,6 +5,8 @@
 // Don't open a console window alongside the editor on Windows.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod disk;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -52,6 +54,41 @@ const FILE_TYPES: &[&str] = &[
     "Bytes after a program (machine code started by",
     "SYS) are kept and saved after it again; opening",
     "offers to strip them off.",
+    "",
+    "DISK IMAGES",
+    "",
+    ".D64  1541 disks (35 or 40 tracks)",
+    ".D71  1571 disks",
+    ".D81  1581 disks, with directories (partitions)",
+    "",
+    "File > Open from Image and Save to Image read and",
+    "write the files on CBM DOS disks. A file opened",
+    "from an image stays linked to it: Save (Ctrl+S)",
+    "writes it back, keeping its file type.",
+    "",
+    "Opening: a PRG file is read by its contents (a",
+    "BASIC program, or text); SEQ, USR and REL files",
+    "as PETSCII text.",
+    "",
+    "Saving: choose PRG, SEQ or USR beside the name",
+    "(BASIC programs start as PRG, text as SEQ). Names",
+    "are up to 16 characters. Locked files (PRG<) can't",
+    "be replaced. On a 1581 disk, Create Directory",
+    "makes a partition of 3 tracks or more.",
+    "",
+    "New Image makes a blank 1541, 1571 or 1581 disk",
+    "with a disk name and two-character ID, as the",
+    "drive's N0:NAME,ID does.",
+    "",
+    "Keep backups of your disk images: saving changes",
+    "the image file itself. You are responsible for",
+    "your own files and data.",
+    "",
+    "An image file that's read-only on the PC is",
+    "treated as write-protected and never changed.",
+    "Don't save to an image mounted in an emulator: it",
+    "keeps its own copy and can write it back over the",
+    "editor's changes.",
     "",
     "EXPORT AND IMPORT",
     "",
@@ -239,6 +276,11 @@ fn about() -> String {
          Licensed under the GNU GPL, version 3 or later.\n\
          See Help > Licensing for details.\n\
          \n\
+         WARNING: Use at your own risk. There is no warranty.\n\
+         You are responsible for your own files: keep backups.\n\
+         The authors are not responsible for lost or damaged\n\
+         files, disk images or data.\n\
+         \n\
          Source code:\n\
          {}",
         env!("CARGO_PKG_VERSION"),
@@ -371,7 +413,7 @@ fn main() -> ExitCode {
             system(&model::PET, PET_HELP),
             system(&model::PET8032, PET_HELP),
         ],
-        disks: None,
+        disks: Some(Box::new(disk::CbmDisks)),
         icon: b'C',
         file_types: OPEN_FILTERS,
         file_types_help: FILE_TYPES,

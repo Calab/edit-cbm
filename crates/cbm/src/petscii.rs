@@ -111,6 +111,10 @@ impl retro_core::FileFormat for PetsciiText {
         &["TXT"]
     }
 
+    fn disk_file_type(&self) -> &'static str {
+        "SEQ"
+    }
+
     fn detect(&self, _bytes: &[u8]) -> bool {
         true
     }

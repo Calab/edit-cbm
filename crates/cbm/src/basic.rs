@@ -889,6 +889,10 @@ impl FileFormat for CbmBasic {
         self.memory
     }
 
+    fn disk_file_type(&self) -> &'static str {
+        "PRG"
+    }
+
     fn can_encode(&self) -> bool {
         true
     }

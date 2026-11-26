@@ -24,6 +24,8 @@ pub enum Field {
     SectorSize,
     Container,
     Volume,
+    /// The two-character disk ID (Commodore disks).
+    VolumeId,
     Create,
     Cancel,
 }
@@ -31,8 +33,8 @@ pub enum Field {
 /// Sizes in each row of radio buttons.
 const PER_ROW: usize = 3;
 
-/// The longest volume name.
-const VOLUME_MAX: usize = 8;
+/// The disk ID's length.
+const ID_LEN: usize = 2;
 
 /// One file system's choices, from the machine.
 struct System {
@@ -40,6 +42,10 @@ struct System {
     sizes: &'static [DiskSize],
     custom: &'static [usize],
     volume_name: bool,
+    volume_max: usize,
+    volume_id: bool,
+    /// For each size, the only image type that holds it, if one does.
+    fixed: Vec<Option<usize>>,
 }
 
 /// What a key or click asks for.
@@ -62,6 +68,9 @@ pub struct NewImagePopup {
     custom_size: usize,
     container: usize,
     volume: Vec<u8>,
+    volume_id: Vec<u8>,
+    /// What the volume name is called ("Disk name:").
+    volume_label: &'static str,
     focus: Field,
     /// Why the last Create failed.
     pub error: Option<String>,
@@ -76,6 +85,11 @@ impl NewImagePopup {
                 sizes: disks.new_sizes(i),
                 custom: disks.custom_sector_sizes(i),
                 volume_name: disks.has_volume_name(i),
+                volume_max: disks.volume_name_max(i),
+                volume_id: disks.has_volume_id(i),
+                fixed: (0..disks.new_sizes(i).len())
+                    .map(|s| disks.fixed_container(i, s))
+                    .collect(),
             })
             .collect();
         let containers = disks
@@ -99,6 +113,8 @@ impl NewImagePopup {
             custom_size: 1,
             container: 0,
             volume: Vec::new(),
+            volume_id: Vec::new(),
+            volume_label: disks.volume_name_label(),
             focus: Field::System,
             error: None,
             hits: Vec::new(),
@@ -107,6 +123,11 @@ impl NewImagePopup {
 
     fn sys(&self) -> &System {
         &self.systems[self.system]
+    }
+
+    /// The image type the chosen disk must be, if it decides it.
+    fn fixed(&self) -> Option<usize> {
+        self.sys().fixed.get(self.size).copied().flatten()
     }
 
     fn is_custom(&self) -> bool {
@@ -134,9 +155,12 @@ impl NewImagePopup {
         self.size = self.size.min(self.sys().sizes.len() - 1);
         let custom = self.sys().custom.len();
         self.custom_size = self.custom_size.min(custom.saturating_sub(1));
-        if !self.holds(self.container) {
+        if let Some(c) = self.fixed() {
+            self.container = c;
+        } else if !self.holds(self.container) {
             self.container = 0;
         }
+        self.volume.truncate(self.sys().volume_max);
         self.error = None;
     }
 
@@ -158,6 +182,11 @@ impl NewImagePopup {
             container: self.container,
             volume_name: if self.sys().volume_name {
                 self.volume.clone()
+            } else {
+                Vec::new()
+            },
+            volume_id: if self.sys().volume_id {
+                self.volume_id.clone()
             } else {
                 Vec::new()
             },
@@ -197,9 +226,14 @@ impl NewImagePopup {
                 v.push(Field::SectorSize);
             }
         }
-        v.push(Field::Container);
+        if self.fixed().is_none() {
+            v.push(Field::Container);
+        }
         if self.sys().volume_name {
             v.push(Field::Volume);
+        }
+        if self.sys().volume_id {
+            v.push(Field::VolumeId);
         }
         v.extend([Field::Create, Field::Cancel]);
         v
@@ -233,9 +267,17 @@ impl NewImagePopup {
                 }
             }
             Field::Volume => {
+                let max = self.sys().volume_max;
                 for &c in codes {
-                    if (0x21..=0x7E).contains(&c) && self.volume.len() < VOLUME_MAX {
+                    if (0x20..=0x7E).contains(&c) && self.volume.len() < max {
                         self.volume.push(c);
+                    }
+                }
+            }
+            Field::VolumeId => {
+                for &c in codes {
+                    if (0x20..=0x7E).contains(&c) && self.volume_id.len() < ID_LEN {
+                        self.volume_id.push(c);
                     }
                 }
             }
@@ -273,6 +315,9 @@ impl NewImagePopup {
                     }
                     Field::Volume => {
                         self.volume.pop();
+                    }
+                    Field::VolumeId => {
+                        self.volume_id.pop();
                     }
                     _ => {}
                 }
@@ -342,7 +387,14 @@ impl NewImagePopup {
 
         let lh = font.line_height();
         let row = lh.max(cell) + pad * 2;
-        let labels = ["DOS:", "Disk:", "Sectors:", "Image type:", "Volume name:"];
+        let labels = [
+            "DOS:",
+            "Disk:",
+            "Sectors:",
+            "Image type:",
+            self.volume_label,
+            "Disk ID:",
+        ];
         let label_w = labels.iter().map(|l| font.measure(l)).max().unwrap_or(0);
         let radio = |font: &mut UiFont, opts: &[&str]| -> i32 {
             opts.iter()
@@ -350,10 +402,11 @@ impl NewImagePopup {
                 .sum()
         };
         // The chosen system's choices ('static, so no borrow of self).
-        let (sizes, custom, volume_name) = {
+        let (sizes, custom, volume_name, volume_max, volume_id) = {
             let s = self.sys();
-            (s.sizes, s.custom, s.volume_name)
+            (s.sizes, s.custom, s.volume_name, s.volume_max, s.volume_id)
         };
+        let fixed = self.fixed().is_some();
         let size_labels: Vec<&str> = sizes.iter().map(|s| s.label).collect();
         let system_names: Vec<&str> = self.systems.iter().map(|s| s.name).collect();
         let mut longest = radio(font, &system_names);
@@ -369,7 +422,12 @@ impl NewImagePopup {
         let title_h = lh + pad * 2;
         let button_h = lh + pad * 2;
         let size_rows = sizes.len().div_ceil(PER_ROW) as i32;
-        let rows = 1 + size_rows + i32::from(self.is_custom()) + 1 + i32::from(volume_name);
+        let rows = 1
+            + size_rows
+            + i32::from(self.is_custom())
+            + i32::from(!fixed)
+            + i32::from(volume_name)
+            + i32::from(volume_id);
         let notes = error_lines.len().max(1) as i32;
         let h = title_h + pad * 3 + rows * row + notes * lh + pad * 3 + button_h + pad * 3;
         let x0 = (width as i32 - w) / 2;
@@ -389,6 +447,7 @@ impl NewImagePopup {
         let mut y = y0 + title_h + pad * 3;
         let text_y = |y: i32| y + (row - lh) / 2;
         let mut glyphs = None;
+        let mut ids = None;
         let mut hits = std::mem::take(&mut self.hits);
         hits.clear();
         let holds: Vec<bool> = (0..self.containers.len()).map(|c| self.holds(c)).collect();
@@ -433,24 +492,27 @@ impl NewImagePopup {
                 let _ = cx;
                 y += row;
             }
-            ui.font
-                .draw(ui.canvas, lx, text_y(y), "Image type:", t.text);
-            let names: Vec<&str> = self.containers.iter().map(|c| c.0).collect();
-            let end = ui.choice(Field::Container, fx, text_y(y), &names, self.container);
-            if let Some(c) = holds.iter().position(|&h| !h) {
-                let note = format!(
-                    "({} holds only {}-byte sectors)",
-                    self.containers[c].0,
-                    self.containers[c].1.first().copied().unwrap_or(128)
-                );
+            if !fixed {
                 ui.font
-                    .draw(ui.canvas, end + pad * 4, text_y(y), &note, t.dim);
+                    .draw(ui.canvas, lx, text_y(y), "Image type:", t.text);
+                let names: Vec<&str> = self.containers.iter().map(|c| c.0).collect();
+                let end = ui.choice(Field::Container, fx, text_y(y), &names, self.container);
+                if let Some(c) = holds.iter().position(|&h| !h) {
+                    let note = format!(
+                        "({} holds only {}-byte sectors)",
+                        self.containers[c].0,
+                        self.containers[c].1.first().copied().unwrap_or(128)
+                    );
+                    ui.font
+                        .draw(ui.canvas, end + pad * 4, text_y(y), &note, t.dim);
+                }
+                y += row;
             }
-            y += row;
+            let mut id_glyphs = None;
             if volume_name {
                 ui.font
-                    .draw(ui.canvas, lx, text_y(y), "Volume name:", t.text);
-                let fw = cell * VOLUME_MAX as i32 + cell + pad * 2;
+                    .draw(ui.canvas, lx, text_y(y), self.volume_label, t.text);
+                let fw = cell * volume_max as i32 + cell + pad * 2;
                 let r = Rect::new(
                     fx,
                     y + (row - (cell + pad)) / 2,
@@ -470,6 +532,28 @@ impl NewImagePopup {
                 glyphs = Some((gx, gy, self.volume.clone()));
                 y += row;
             }
+            if volume_id {
+                ui.font.draw(ui.canvas, lx, text_y(y), "Disk ID:", t.text);
+                let fw = cell * ID_LEN as i32 + cell + pad * 2;
+                let r = Rect::new(
+                    fx,
+                    y + (row - (cell + pad)) / 2,
+                    fw as u32,
+                    (cell + pad) as u32,
+                );
+                ui.field_box(Field::VolumeId, r);
+                let gx = fx + pad;
+                let gy = r.y() + pad / 2;
+                if self.focus == Field::VolumeId {
+                    let cx = gx + self.volume_id.len() as i32 * cell;
+                    ui.canvas.set_draw_color(t.text);
+                    let _ = ui
+                        .canvas
+                        .fill_rect(Rect::new(cx, gy, cell as u32, cell as u32));
+                }
+                id_glyphs = Some((gx, gy, self.volume_id.clone()));
+                y += row;
+            }
             for (i, line) in error_lines.iter().enumerate() {
                 ui.font
                     .draw(ui.canvas, lx, y + pad + i as i32 * lh, line, warning);
@@ -485,9 +569,12 @@ impl NewImagePopup {
                 bx -= pad * 2;
             }
             ui.draw_focus();
+            if let Some(g) = id_glyphs {
+                ids = Some(g);
+            }
         }
         self.hits = hits;
-        if let Some((x, y, codes)) = glyphs {
+        for (x, y, codes) in glyphs.into_iter().chain(ids) {
             let mut grid = Grid {
                 canvas,
                 atlas,

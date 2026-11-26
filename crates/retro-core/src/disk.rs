@@ -48,6 +48,9 @@ pub struct DiskEntry {
     pub modified: Option<DateTime>,
     /// The disk's records for it don't add up: reading it will fail.
     pub damaged: bool,
+    /// Its type as the disk's own listing shows it (`PRG`, `*SEQ`, `PRG<`
+    /// on a Commodore disk), or empty where files have no types.
+    pub kind: String,
 }
 
 /// What kind of problem a disk call had, for the cases the editor
@@ -122,6 +125,9 @@ pub struct NewDisk {
     pub container: usize,
     /// The volume name, on systems that have one (empty: none).
     pub volume_name: Vec<u8>,
+    /// The disk ID, on systems that have one (two characters on a
+    /// Commodore disk).
+    pub volume_id: Vec<u8>,
 }
 
 /// The kinds of disk image a machine reads: one for the whole program.
@@ -163,6 +169,28 @@ pub trait DiskImages {
         false
     }
 
+    /// The longest volume name disks of `system` can have.
+    fn volume_name_max(&self, _system: usize) -> usize {
+        8
+    }
+
+    /// What New Image calls the volume name, e.g. "Disk name:".
+    fn volume_name_label(&self) -> &'static str {
+        "Volume name:"
+    }
+
+    /// Whether disks of `system` have a two-character disk ID.
+    fn has_volume_id(&self, _system: usize) -> bool {
+        false
+    }
+
+    /// The only image type (an index into [`DiskImages::extensions`])
+    /// that can hold disk size `size` of `system`, if it decides it (a
+    /// 1541 disk is always a D64); New Image then doesn't ask.
+    fn fixed_container(&self, _system: usize, _size: usize) -> Option<usize> {
+        None
+    }
+
     /// Whether image type `container` (an index into
     /// [`DiskImages::extensions`]) can hold sectors of `sector_size`.
     fn container_holds(&self, _container: usize, _sector_size: usize) -> bool {
@@ -191,6 +219,35 @@ pub trait DiskVolume {
     /// The file system keeps dates.
     fn has_dates(&self) -> bool;
 
+    /// The disk's name and ID as its directory listing heads them, in
+    /// machine codes, to show above the directories (`None`: nothing).
+    fn title(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// The file types [`DiskVolume::write`] can give a file (`PRG`,
+    /// `SEQ`, `USR`); empty where files have no types.
+    fn file_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Names are NAME and EXT, shown in two columns (Atari DOS); else
+    /// one name of up to [`DiskVolume::name_max`] characters.
+    fn names_have_extensions(&self) -> bool {
+        true
+    }
+
+    /// The longest name a file can have, extension included.
+    fn name_max(&self) -> usize {
+        12
+    }
+
+    /// A new directory's size, where the disk needs one (a 1581
+    /// partition, in tracks): the least, and what to offer first.
+    fn dir_size(&self) -> Option<(u32, u32)> {
+        None
+    }
+
     /// The image is write-protected. [`DiskVolume::write`] and
     /// [`DiskVolume::make_dir`] then always fail.
     fn write_protected(&self) -> bool;
@@ -202,21 +259,24 @@ pub trait DiskVolume {
     /// A file's contents.
     fn read(&self, path: &[Vec<u8>]) -> DiskResult<Vec<u8>>;
 
-    /// Write a file. If it's already there, fails with
-    /// [`DiskErrorKind::AlreadyExists`] unless `replace`; a locked file is
-    /// refused either way. `when` dates it, on disks that keep dates
-    /// (`None`: a new file is undated, a replaced one keeps its date).
-    /// On any error the disk is unchanged.
+    /// Write a file, of type `file_type` (an index into
+    /// [`DiskVolume::file_types`]; ignored where files have no types). If
+    /// it's already there, fails with [`DiskErrorKind::AlreadyExists`]
+    /// unless `replace`; a locked file is refused either way. `when` dates
+    /// it, on disks that keep dates (`None`: a new file is undated, a
+    /// replaced one keeps its date). On any error the disk is unchanged.
     fn write(
         &mut self,
         path: &[Vec<u8>],
         data: &[u8],
         replace: bool,
         when: Option<DateTime>,
+        file_type: usize,
     ) -> DiskResult<()>;
 
-    /// Make a directory (the last name in `path`) inside an existing one.
-    fn make_dir(&mut self, path: &[Vec<u8>], when: Option<DateTime>) -> DiskResult<()>;
+    /// Make a directory (the last name in `path`) inside an existing one,
+    /// of `size` where [`DiskVolume::dir_size`] says the disk needs one.
+    fn make_dir(&mut self, path: &[Vec<u8>], when: Option<DateTime>, size: u32) -> DiskResult<()>;
 
     /// Is `name` allowed for a new file or directory? `Err` says why not.
     fn check_name(&self, name: &[u8]) -> DiskResult<()>;

@@ -35,6 +35,8 @@ pub enum Field {
     Files,
     /// The File name box (Save to Image).
     Name,
+    /// The file type beside it, on disks whose files have types.
+    FileType,
     Choose,
     NewDir,
     NewImage,
@@ -90,6 +92,10 @@ pub enum Action {
 pub struct NewDirPopup {
     pub name: Vec<u8>,
     cursor: usize,
+    /// The size typed, where the disk needs one (tracks on a 1581), and
+    /// whether it has the focus rather than the name.
+    pub size: String,
+    on_size: bool,
     pub error: Option<String>,
     /// Create (true) and Cancel (false), from the last draw.
     hits: Vec<(Rect, bool)>,
@@ -107,6 +113,16 @@ pub struct ImagePage {
     pub error: Option<String>,
     write_protected: bool,
     has_directories: bool,
+    /// The disk's name and ID, shown above the directories.
+    title: Option<Vec<u8>>,
+    /// Names are NAME.EXT in two columns (else one name).
+    names_ext: bool,
+    name_max: usize,
+    /// The types a saved file can have, and the one chosen.
+    file_types: &'static [&'static str],
+    pub file_type: usize,
+    /// A new directory's least size and the size offered, if it needs one.
+    dir_size: Option<(u32, u32)>,
     /// The Create Directory pop-up, while it's open.
     pub new_dir: Option<NewDirPopup>,
     /// The New Image pop-up, while it's open.
@@ -152,6 +168,12 @@ impl ImagePage {
             error: None,
             write_protected: false,
             has_directories: false,
+            title: None,
+            names_ext: true,
+            name_max: NAME_MAX,
+            file_types: &[],
+            file_type: 0,
+            dir_size: None,
             new_dir: None,
             new_image: None,
             can_new_image: false,
@@ -193,6 +215,12 @@ impl ImagePage {
         }
         self.has_dates = vol.has_dates();
         self.has_directories = vol.has_directories();
+        self.title = vol.title();
+        self.names_ext = vol.names_have_extensions();
+        self.name_max = vol.name_max();
+        self.file_types = vol.file_types();
+        self.file_type = self.file_type.min(self.file_types.len().saturating_sub(1));
+        self.dir_size = vol.dir_size();
         self.new_dir = None;
         self.tree.clear();
         self.add_dir(vol.as_ref(), Vec::new(), top, 0);
@@ -206,6 +234,37 @@ impl ImagePage {
         // The name, as this disk's names allow.
         let name = std::mem::take(&mut self.name);
         self.set_name(&name);
+    }
+
+    /// Treat the image as write-protected (its file is read-only).
+    pub fn set_write_protected(&mut self) {
+        if !self.write_protected {
+            self.write_protected = true;
+            self.info
+                .push_str(", write-protected (the file is read-only)");
+        }
+    }
+
+    /// Choose file type `name` for saving, if the disk has it.
+    pub fn set_file_type(&mut self, name: &str) {
+        if let Some(i) = self.file_types.iter().position(|&t| t == name) {
+            self.file_type = i;
+        }
+    }
+
+    /// The file type chosen for saving, on disks whose files have types.
+    pub fn chosen_file_type(&self) -> Option<&'static str> {
+        self.file_types.get(self.file_type).copied()
+    }
+
+    /// The size typed in the Create Directory pop-up (the size offered
+    /// if it isn't a number).
+    pub fn new_dir_size(&self) -> u32 {
+        let offered = self.dir_size.map_or(0, |(_, d)| d);
+        self.new_dir
+            .as_ref()
+            .and_then(|p| p.size.parse().ok())
+            .unwrap_or(offered)
     }
 
     /// The image couldn't be read or opened.
@@ -293,6 +352,16 @@ impl ImagePage {
         let existing = self.entries().iter().any(|e| !e.is_dir && e.name == name);
         self.name = if existing {
             name.to_vec()
+        } else if !self.names_ext {
+            // One name: a PC file's extension (".seq") left off.
+            let base = match name.iter().rposition(|&c| c == b'.') {
+                Some(d) if (1..=3).contains(&(name.len() - d - 1)) => &name[..d],
+                _ => name,
+            };
+            base.iter()
+                .filter_map(|&c| self.name_char(c))
+                .take(self.name_max)
+                .collect()
         } else {
             let dot = name.iter().rposition(|&c| c == b'.');
             let (base, ext) = match dot {
@@ -336,14 +405,26 @@ impl ImagePage {
             p.type_codes(codes);
             return;
         }
+        if let Some(p) = &mut self.new_dir
+            && p.on_size
+        {
+            for &c in codes {
+                if c.is_ascii_digit() && p.size.len() < 3 {
+                    p.size.push(c as char);
+                }
+            }
+            p.error = None;
+            return;
+        }
         let codes: Vec<u8> = codes.iter().filter_map(|&c| self.name_char(c)).collect();
+        let max = self.name_max;
         let (name, cursor) = match &mut self.new_dir {
             Some(p) => (&mut p.name, &mut p.cursor),
             None if self.focus == Field::Name => (&mut self.name, &mut self.cursor),
             None => return,
         };
         for c in codes {
-            if name.len() >= NAME_MAX {
+            if name.len() >= max {
                 break;
             }
             name.insert(*cursor, c);
@@ -397,15 +478,22 @@ impl ImagePage {
             self.new_dir = Some(NewDirPopup {
                 name: Vec::new(),
                 cursor: 0,
+                size: self.dir_size.map_or(String::new(), |(_, d)| d.to_string()),
+                on_size: false,
                 error: None,
                 hits: Vec::new(),
             });
         }
     }
 
-    /// Why the pop-up's name can't be used, if it can't.
+    /// Why the pop-up's name (or size) can't be used, if it can't.
     fn new_dir_problem(&self) -> Option<String> {
         let p = self.new_dir.as_ref()?;
+        if let Some((least, _)) = self.dir_size
+            && p.size.parse::<u32>().map_or(true, |n| n < least)
+        {
+            return Some(format!("The size must be at least {least}"));
+        }
         self.problem_with(&p.name, true)
     }
 
@@ -435,7 +523,11 @@ impl ImagePage {
                 Field::Cancel,
             ],
             Mode::Save => {
-                let mut v = vec![Field::Tree, Field::Files, Field::Name, Field::Choose];
+                let mut v = vec![Field::Tree, Field::Files, Field::Name];
+                if !self.file_types.is_empty() {
+                    v.push(Field::FileType);
+                }
+                v.push(Field::Choose);
                 if self.can_make_dir() {
                     v.push(Field::NewDir);
                 }
@@ -537,9 +629,15 @@ impl ImagePage {
         if self.new_dir.is_some() {
             let ok = self.new_dir_problem().is_none();
             let p = self.new_dir.as_mut().unwrap();
+            let sized = self.dir_size.is_some();
             match k {
                 K::ESCAPE => self.new_dir = None,
                 K::RETURN | K::KP_ENTER if ok => return Action::MakeDir,
+                K::TAB | K::UP | K::DOWN if sized => p.on_size = !p.on_size,
+                K::BACKSPACE if p.on_size => {
+                    p.size.pop();
+                }
+                _ if p.on_size => {}
                 _ => edit_name(&mut p.name, &mut p.cursor, k),
             }
             return Action::None;
@@ -561,6 +659,15 @@ impl ImagePage {
             Field::Go if press => return self.go(),
             Field::Cancel if press => return Action::Close,
             Field::Name if enter => return self.save(),
+            Field::FileType if enter => return self.save(),
+            Field::FileType => {
+                let n = self.file_types.len().max(1);
+                match k {
+                    K::LEFT => self.file_type = (self.file_type + n - 1) % n,
+                    K::RIGHT | K::SPACE => self.file_type = (self.file_type + 1) % n,
+                    _ => {}
+                }
+            }
             Field::Name => edit_name(&mut self.name, &mut self.cursor, k),
             Field::Tree => {
                 let n = self.tree.len();
@@ -658,9 +765,15 @@ impl ImagePage {
             }
             return Action::None;
         }
-        if let Some(&(_, f, _)) = self.hits.iter().find(|(r, ..)| r.contains_point((x, y))) {
+        if let Some(&(_, f, op)) = self.hits.iter().find(|(r, ..)| r.contains_point((x, y))) {
             self.focus = f;
             return match f {
+                Field::FileType => {
+                    if let Op::Choose(i) = op {
+                        self.file_type = i;
+                    }
+                    Action::None
+                }
                 Field::Choose => Action::Choose,
                 Field::NewDir => {
                     self.open_new_dir();
@@ -737,9 +850,25 @@ impl ImagePage {
         let row_h = lh.max(cell) + pad;
         let button = |font: &mut UiFont, s: &str| font.measure(s) + pad * 4;
         let digit = font.measure("0");
-        // Files: lock mark, NAME EXT, size, date.
-        let mark_w = font.measure("*") + pad * 2;
-        let name_w = cell * 12;
+        // Files: lock mark, NAME EXT, size, date (Atari); NAME, type,
+        // blocks, size (Commodore).
+        let kinds = !self.file_types.is_empty();
+        let mark_w = if self.names_ext {
+            font.measure("*") + pad * 2
+        } else {
+            0
+        };
+        let name_w = cell * self.name_max as i32 + pad;
+        let kind_w = if kinds {
+            font.measure("*PRG<") + pad * 3
+        } else {
+            0
+        };
+        let blocks_w = if kinds {
+            font.measure("Blocks") + pad * 3
+        } else {
+            0
+        };
         let size_w = font.measure("000000") + pad * 3;
         let date_w = if self.has_dates {
             font.measure("0000-00-00 00:00") + pad * 3
@@ -748,8 +877,11 @@ impl ImagePage {
         };
         // Each list has a column of scroll arrows at its right.
         let arrow_w = lh;
-        let files_w = pad * 2 + mark_w + name_w + size_w + date_w + pad * 2 + arrow_w;
-        let want_w = cell * 16 + pad * 4 + files_w + pad * 12;
+        let files_w =
+            pad * 2 + mark_w + name_w + kind_w + blocks_w + size_w + date_w + pad * 2 + arrow_w;
+        // The directories are 16 characters wide, or the disk's title.
+        let tree_cells = self.title.as_ref().map_or(16, |t| t.len().max(16)) as i32;
+        let want_w = cell * tree_cells + pad * 4 + files_w + pad * 12;
         let w = want_w
             .max(font.measure("M") * 36)
             .min(width as i32 - pad * 4);
@@ -757,7 +889,8 @@ impl ImagePage {
         let x0 = (width as i32 - w) / 2;
         let y0 = ((height as i32 - h) / 2).max(0);
         // The directories give up room first when the window is narrow.
-        let tree_w = (w - pad * 12 - files_w).clamp(cell * 8 + pad * 4, cell * 16 + pad * 4);
+        let tree_w =
+            (w - pad * 12 - files_w).clamp(cell * 8 + pad * 4, cell * tree_cells + pad * 4);
 
         let frame = Rect::new(x0, y0, w as u32, h as u32);
         let title_h = lh + pad * 2;
@@ -784,6 +917,7 @@ impl ImagePage {
         // Names to draw in the machine's characters: where, what, colour,
         // and the box they're clipped to.
         let glyphs: Vec<(i32, i32, Vec<u8>, Color, Rect)>;
+        let mut small_title = None;
         {
             let mut ui = Ui {
                 canvas: &mut *canvas,
@@ -835,11 +969,37 @@ impl ImagePage {
                 (rx - files_x).max(10) as u32,
                 list_h as u32,
             );
-            ui.font.draw(ui.canvas, lx, y, "Directories", t.text);
+            let mut g = Vec::new();
+            // Over the directories: the disk's name and ID, if it has
+            // them, in its own characters.
+            match &self.title {
+                // Half size if it won't fit full size (still the
+                // machine's own 8x8 pixels, at zoom 2 and up).
+                Some(title) if title.len() as i32 * cell > tree_w && cell >= 16 => {
+                    small_title = Some((lx, y + (lh - cell / 2) / 2, title.clone()));
+                }
+                Some(title) => g.push((
+                    lx,
+                    y + (lh - cell) / 2,
+                    title.clone(),
+                    t.text,
+                    Rect::new(lx, y - pad, tree_w as u32, (lh + pad * 2) as u32),
+                )),
+                None => {
+                    ui.font.draw(ui.canvas, lx, y, "Directories", t.text);
+                }
+            }
             // Column headings over the files.
             let name_x = files_x + pad * 2 + mark_w;
-            let size_r = name_x + name_w + size_w;
+            let kind_x = name_x + name_w;
+            let blocks_r = kind_x + kind_w + blocks_w - pad * 3;
+            let size_r = name_x + name_w + kind_w + blocks_w + size_w;
             ui.font.draw(ui.canvas, files_x, y, "Files", t.text);
+            if !self.tree.is_empty() && kinds {
+                ui.font.draw(ui.canvas, kind_x, y, "Type", t.dim);
+                let bw = ui.font.measure("Blocks");
+                ui.font.draw(ui.canvas, blocks_r - bw, y, "Blocks", t.dim);
+            }
             if !self.tree.is_empty() {
                 let sw = ui.font.measure("Bytes");
                 ui.font.draw(ui.canvas, size_r - sw, y, "Bytes", t.dim);
@@ -847,7 +1007,6 @@ impl ImagePage {
                     ui.font.draw(ui.canvas, size_r + pad * 3, y, "Date", t.dim);
                 }
             }
-            let mut g = Vec::new();
 
             // The tree.
             let rows = ((list_h - pad) / row_h).max(1) as usize;
@@ -920,14 +1079,24 @@ impl ImagePage {
                 let on = i == self.selected;
                 let fg = row_colors(ui.canvas, r, on, focus == Field::Files);
                 let ty = ry + (row_h - lh) / 2;
-                if e.locked {
-                    ui.font.draw(ui.canvas, files_x + pad * 2, ty, "*", fg);
-                }
-                // NAME EXT, as DOS lists them.
-                let (base, ext) = split_name(&e.name);
                 let gy = ry + (row_h - cell) / 2;
-                g.push((name_x, gy, base.to_vec(), fg, files_box));
-                g.push((name_x + cell * 9, gy, ext.to_vec(), fg, files_box));
+                if self.names_ext {
+                    if e.locked {
+                        ui.font.draw(ui.canvas, files_x + pad * 2, ty, "*", fg);
+                    }
+                    // NAME EXT, as DOS lists them.
+                    let (base, ext) = split_name(&e.name);
+                    g.push((name_x, gy, base.to_vec(), fg, files_box));
+                    g.push((name_x + cell * 9, gy, ext.to_vec(), fg, files_box));
+                } else {
+                    g.push((name_x, gy, e.name.clone(), fg, files_box));
+                }
+                if kinds {
+                    ui.font.draw(ui.canvas, kind_x, ty, &e.kind, fg);
+                    let b = e.sectors.to_string();
+                    let bw = ui.font.measure(&b);
+                    ui.font.draw(ui.canvas, blocks_r - bw, ty, &b, fg);
+                }
                 let size = if e.is_dir {
                     "<DIR>".to_string()
                 } else if e.damaged {
@@ -967,7 +1136,7 @@ impl ImagePage {
                 ui.font
                     .draw(ui.canvas, lx, ny + (row_h - lh) / 2, label, t.text);
                 let bx = lx + ui.font.measure(label) + pad * 3;
-                let field_w = cell * NAME_MAX as i32 + cell + pad * 2;
+                let field_w = cell * self.name_max as i32 + cell + pad * 2;
                 let r = Rect::new(bx, ny, field_w as u32, row_h as u32);
                 ui.canvas.set_draw_color(Color::RGB(0xFF, 0xFF, 0xFF));
                 let _ = ui.canvas.fill_rect(r);
@@ -987,12 +1156,23 @@ impl ImagePage {
                     }
                 }
                 let note = if self.write_protected {
-                    Some("The image is write-protected: it can't be saved to".to_string())
+                    Some("Write-protected: can't save here".to_string())
                 } else {
                     problem.filter(|p| !p.is_empty())
                 };
+                // The file type: ( ) PRG ( ) SEQ ( ) USR.
+                let mut after = bx + field_w + pad * 4;
+                if kinds {
+                    after = ui.choice(
+                        Field::FileType,
+                        after,
+                        ny + (row_h - lh) / 2,
+                        self.file_types,
+                        self.file_type,
+                    ) + pad * 4;
+                }
                 if let Some(note) = note {
-                    let tx = bx + field_w + pad * 4;
+                    let tx = after;
                     ui.font
                         .draw(ui.canvas, tx, ny + (row_h - lh) / 2, &note, warning);
                 }
@@ -1045,6 +1225,17 @@ impl ImagePage {
             grid.codes(0, 0, &codes, fg);
         }
         canvas.set_clip_rect(None);
+        if let Some((x, y, codes)) = small_title {
+            let mut grid = Grid {
+                canvas: &mut *canvas,
+                atlas: &mut *atlas,
+                cell: (cell / 2) as u32,
+                cell_w: (cell / 2) as u32,
+                origin_x: x,
+                origin_y: y,
+            };
+            grid.codes(0, 0, &codes, t.text);
+        }
 
         if self.new_dir.is_some() {
             self.draw_new_dir(canvas, font, atlas, (width, height), pad, cell, warning);
@@ -1080,12 +1271,17 @@ impl ImagePage {
 
         let lh = font.line_height();
         let row_h = lh.max(cell) + pad;
-        let label_w = font.measure("Inside:").max(font.measure("Name:"));
-        let field_w = cell * NAME_MAX as i32 + cell + pad * 2;
+        let sized = self.dir_size.is_some();
+        let label_w = font
+            .measure("Inside:")
+            .max(font.measure("Name:"))
+            .max(font.measure("Tracks:"));
+        let field_w = cell * self.name_max as i32 + cell + pad * 2;
         let w = (pad * 8 + label_w + pad * 3 + field_w).max(font.measure("M") * 26);
         let title_h = lh + pad * 2;
         let button_h = lh + pad * 2;
-        let h = title_h + pad * 3 + row_h * 2 + pad * 2 + lh + pad * 3 + button_h + pad * 3;
+        let rows = if sized { 3 } else { 2 };
+        let h = title_h + pad * 3 + row_h * rows + pad * 2 + lh + pad * 3 + button_h + pad * 3;
         let x0 = (width as i32 - w) / 2;
         let y0 = (height as i32 - h) / 2;
         let frame = Rect::new(x0, y0, w as u32, h as u32);
@@ -1109,24 +1305,44 @@ impl ImagePage {
         // Name: [        ]
         font.draw(canvas, lx, y + (row_h - lh) / 2, "Name:", t.text);
         let r = Rect::new(fx, y, field_w as u32, row_h as u32);
-        canvas.set_draw_color(t.highlight);
+        canvas.set_draw_color(if p.on_size { t.border } else { t.highlight });
         let _ = canvas.draw_rect(r);
-        let _ = canvas.draw_rect(Rect::new(
-            r.x() + 1,
-            r.y() + 1,
-            r.width() - 2,
-            r.height() - 2,
-        ));
+        if !p.on_size {
+            let _ = canvas.draw_rect(Rect::new(
+                r.x() + 1,
+                r.y() + 1,
+                r.width() - 2,
+                r.height() - 2,
+            ));
+        }
         let gx = fx + pad;
         let gy = y + (row_h - cell) / 2;
         glyphs.push((gx, gy, p.name.clone(), t.text));
-        let cx = gx + p.cursor as i32 * cell;
-        canvas.set_draw_color(t.text);
-        let _ = canvas.fill_rect(Rect::new(cx, gy, cell as u32, cell as u32));
-        if let Some(&c) = p.name.get(p.cursor) {
-            glyphs.push((cx, gy, vec![c], Color::RGB(0xFF, 0xFF, 0xFF)));
+        if !p.on_size {
+            let cx = gx + p.cursor as i32 * cell;
+            canvas.set_draw_color(t.text);
+            let _ = canvas.fill_rect(Rect::new(cx, gy, cell as u32, cell as u32));
+            if let Some(&c) = p.name.get(p.cursor) {
+                glyphs.push((cx, gy, vec![c], Color::RGB(0xFF, 0xFF, 0xFF)));
+            }
         }
-        y += row_h + pad * 2;
+        y += row_h + pad;
+        // Tracks: [3  ] (a 1581 partition's size)
+        if sized {
+            font.draw(canvas, lx, y + (row_h - lh) / 2, "Tracks:", t.text);
+            let sw = font.measure("0000") + pad * 2;
+            let r = Rect::new(fx, y, sw as u32, row_h as u32);
+            canvas.set_draw_color(if p.on_size { t.highlight } else { t.border });
+            let _ = canvas.draw_rect(r);
+            let text = if p.on_size {
+                format!("{}_", p.size)
+            } else {
+                p.size.clone()
+            };
+            font.draw(canvas, fx + pad, y + (row_h - lh) / 2, &text, t.text);
+            y += row_h + pad;
+        }
+        y += pad;
         // Why it can't be made.
         let note = p
             .error

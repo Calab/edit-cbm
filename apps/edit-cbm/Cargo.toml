@@ -9,6 +9,9 @@ version.workspace = true
 
 [dependencies]
 cbm = { path = "../../crates/cbm" }
+# Disk images (D64/D71/D81) and CBM DOS, for the Image Manager. Cargo.lock
+# pins the commit; `cargo update -p cbm-disk` after a change is pushed.
+cbm-disk = { git = "https://github.com/Calab/cbm-disk", branch = "main" }
 retro-core = { path = "../../crates/retro-core" }
 retro-sdl = { path = "../../crates/retro-sdl" }
 

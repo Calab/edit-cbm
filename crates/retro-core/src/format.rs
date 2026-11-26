@@ -73,6 +73,12 @@ pub trait FileFormat: Sync {
         &[]
     }
 
+    /// The file type it's saved as on a disk with types (`PRG`, `SEQ`),
+    /// or empty.
+    fn disk_file_type(&self) -> &'static str {
+        ""
+    }
+
     /// Whether [`FileFormat::encode`] is available.
     fn can_encode(&self) -> bool {
         false

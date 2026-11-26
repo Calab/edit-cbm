@@ -6,6 +6,7 @@ Rust libraries:
   bitflags 2.13.2 - MIT OR Apache-2.0
   block2 0.6.2 - MIT
   bumpalo 3.20.4 - MIT OR Apache-2.0
+  cbm-disk 0.1.0 (https://github.com/Calab/cbm-disk?branch=main#6c3f5e57) - MIT OR Apache-2.0
   cfg-if 1.0.5 - MIT OR Apache-2.0
   core_maths 0.1.1 - MIT
   dispatch2 0.3.1 - Zlib OR Apache-2.0 OR MIT

@@ -43,6 +43,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "cbm-disk"
+version = "0.1.0"
+source = "git+https://github.com/Calab/cbm-disk?branch=main#6c3f5e57f4c4c017bc9dba1a856c9cb1df02c12c"
+
+[[package]]
 name = "cc"
 version = "1.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -102,6 +107,7 @@ name = "edit-cbm"
 version = "0.1.0"
 dependencies = [
  "cbm",
+ "cbm-disk",
  "retro-core",
  "retro-sdl",
  "winresource",
