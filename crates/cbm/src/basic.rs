@@ -27,6 +27,11 @@ pub struct Dialect {
     /// Simons' BASIC: its own keywords are made into `$64` tokens first
     /// (see [`simons_pass`]), then BASIC 2's as usual.
     pub simons: bool,
+    /// BASIC 7.0: its own CRUNCH ([`crunch7`]), and two-byte tokens: a
+    /// prefix and `$02` + the keyword's place in its table, the tables
+    /// in the order CRUNCH searches them.
+    pub basic7: bool,
+    pub prefixed: &'static [(u8, &'static [&'static str])],
 }
 
 /// BASIC 2's keywords (C64 ROM `$A09E`).
@@ -138,6 +143,8 @@ const BASIC4: [&str; 91] = [
 pub static BASIC_1: Dialect = Dialect {
     name: "BASIC 1.0",
     simons: false,
+    basic7: false,
+    prefixed: &[],
     status: "BASIC 1",
     keywords: BASIC2.split_at(75).0,
 };
@@ -145,6 +152,8 @@ pub static BASIC_1: Dialect = Dialect {
 pub static BASIC_2: Dialect = Dialect {
     name: "BASIC 2.0",
     simons: false,
+    basic7: false,
+    prefixed: &[],
     status: "BASIC 2",
     keywords: &BASIC2,
 };
@@ -152,8 +161,199 @@ pub static BASIC_2: Dialect = Dialect {
 pub static BASIC_4: Dialect = Dialect {
     name: "BASIC 4.0",
     simons: false,
+    basic7: false,
+    prefixed: &[],
     status: "BASIC 4",
     keywords: &BASIC4,
+};
+
+/// BASIC 7.0's keywords (C128 ROM `$4417`): BASIC 2's, then its own one-
+/// byte tokens to `$FD`. `$CE` and `$FE` are prefixes, held by a blank
+/// entry.
+const BASIC7: [&str; 126] = [
+    "END",
+    "FOR",
+    "NEXT",
+    "DATA",
+    "INPUT#",
+    "INPUT",
+    "DIM",
+    "READ",
+    "LET",
+    "GOTO",
+    "RUN",
+    "IF",
+    "RESTORE",
+    "GOSUB",
+    "RETURN",
+    "REM",
+    "STOP",
+    "ON",
+    "WAIT",
+    "LOAD",
+    "SAVE",
+    "VERIFY",
+    "DEF",
+    "POKE",
+    "PRINT#",
+    "PRINT",
+    "CONT",
+    "LIST",
+    "CLR",
+    "CMD",
+    "SYS",
+    "OPEN",
+    "CLOSE",
+    "GET",
+    "NEW",
+    "TAB(",
+    "TO",
+    "FN",
+    "SPC(",
+    "THEN",
+    "NOT",
+    "STEP",
+    "+",
+    "-",
+    "*",
+    "/",
+    "^",
+    "AND",
+    "OR",
+    ">",
+    "=",
+    "<",
+    "SGN",
+    "INT",
+    "ABS",
+    "USR",
+    "FRE",
+    "POS",
+    "SQR",
+    "RND",
+    "LOG",
+    "EXP",
+    "COS",
+    "SIN",
+    "TAN",
+    "ATN",
+    "PEEK",
+    "LEN",
+    "STR$",
+    "VAL",
+    "ASC",
+    "CHR$",
+    "LEFT$",
+    "RIGHT$",
+    "MID$",
+    "GO",
+    "RGR",
+    "RCLR",
+    " ",
+    "JOY",
+    "RDOT",
+    "DEC",
+    "HEX$",
+    "ERR$",
+    "INSTR",
+    "ELSE",
+    "RESUME",
+    "TRAP",
+    "TRON",
+    "TROFF",
+    "SOUND",
+    "VOL",
+    "AUTO",
+    "PUDEF",
+    "GRAPHIC",
+    "PAINT",
+    "CHAR",
+    "BOX",
+    "CIRCLE",
+    "GSHAPE",
+    "SSHAPE",
+    "DRAW",
+    "LOCATE",
+    "COLOR",
+    "SCNCLR",
+    "SCALE",
+    "HELP",
+    "DO",
+    "LOOP",
+    "EXIT",
+    "DIRECTORY",
+    "DSAVE",
+    "DLOAD",
+    "HEADER",
+    "SCRATCH",
+    "COLLECT",
+    "COPY",
+    "RENAME",
+    "BACKUP",
+    "DELETE",
+    "RENUMBER",
+    "KEY",
+    "MONITOR",
+    "USING",
+    "UNTIL",
+    "WHILE",
+];
+
+/// BASIC 7.0's `$FE` keywords (ROM `$4609`), from `$FE $02`; blanks hold
+/// numbers CRUNCH can't use (a space, a quote).
+const BASIC7_FE: [&str; 37] = [
+    "BANK",
+    "FILTER",
+    "PLAY",
+    "TEMPO",
+    "MOVSPR",
+    "SPRITE",
+    "SPRCOLOR",
+    "RREG",
+    "ENVELOPE",
+    "SLEEP",
+    "CATALOG",
+    "DOPEN",
+    "APPEND",
+    "DCLOSE",
+    "BSAVE",
+    "BLOAD",
+    "RECORD",
+    "CONCAT",
+    "DVERIFY",
+    "DCLEAR",
+    "SPRSAV",
+    "COLLISION",
+    "BEGIN",
+    "BEND",
+    "WINDOW",
+    "BOOT",
+    "WIDTH",
+    "SPRDEF",
+    "QUIT",
+    "STASH",
+    " ",
+    "FETCH",
+    " ",
+    "SWAP",
+    "OFF",
+    "FAST",
+    "SLOW",
+];
+
+/// BASIC 7.0's `$CE` keywords (ROM `$46C9`), from `$CE $02`.
+const BASIC7_CE: [&str; 9] = [
+    "POT", "BUMP", "PEN", "RSPPOS", "RSPRITE", "RSPCOLOR", "XOR", "RWINDOW", "POINTER",
+];
+
+/// The C128's BASIC 7.0.
+pub static BASIC_7: Dialect = Dialect {
+    name: "BASIC 7.0",
+    status: "BASIC 7",
+    keywords: &BASIC7,
+    simons: false,
+    basic7: true,
+    prefixed: &[(0xFE, &BASIC7_FE), (0xCE, &BASIC7_CE)],
 };
 
 /// Simons' BASIC's keywords, from its cartridge ROM (`$A521`, each
@@ -181,6 +381,8 @@ pub static SIMONS_BASIC: Dialect = Dialect {
     status: "Simons'",
     keywords: &BASIC2,
     simons: true,
+    basic7: false,
+    prefixed: &[],
 };
 
 /// The first byte of a Simons' BASIC keyword.
@@ -267,15 +469,27 @@ impl Dialect {
     /// The keyword table as the ROM holds it: each keyword's last
     /// character with bit 7 set, then a 0.
     fn table(&self) -> Vec<u8> {
-        let mut t = Vec::new();
-        for k in self.keywords {
-            let b = k.as_bytes();
-            t.extend_from_slice(&b[..b.len() - 1]);
-            t.push(b[b.len() - 1] | 0x80);
-        }
-        t.push(0);
-        t
+        table_of(self.keywords)
     }
+
+    /// The keyword for a two-byte token, if it's one.
+    fn prefixed_keyword(&self, prefix: u8, n: u8) -> Option<&'static str> {
+        let (_, table) = self.prefixed.iter().find(|(p, _)| *p == prefix)?;
+        let k = *table.get(usize::from(n).checked_sub(2)?)?;
+        (k != " ").then_some(k)
+    }
+}
+
+/// `keywords` as a ROM keyword table.
+fn table_of(keywords: &[&str]) -> Vec<u8> {
+    let mut t = Vec::new();
+    for k in keywords {
+        let b = k.as_bytes();
+        t.extend_from_slice(&b[..b.len() - 1]);
+        t.push(b[b.len() - 1] | 0x80);
+    }
+    t.push(0);
+    t
 }
 
 /// A program read from a file.
@@ -458,6 +672,14 @@ pub fn list(d: &Dialect, text: &[u8]) -> Vec<u8> {
             }
             continue;
         }
+        // BASIC 7.0's two-byte tokens.
+        if lister.mode == Mode::Normal
+            && let Some(k) = text.get(i + 1).and_then(|&n| d.prefixed_keyword(b, n))
+        {
+            out.extend_from_slice(k.as_bytes());
+            i += 2;
+            continue;
+        }
         if b == b'"' {
             quote = !quote;
         } else if b == b'@' && !quote {
@@ -467,6 +689,105 @@ pub fn list(d: &Dialect, text: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+/// BASIC 7.0's CRUNCH (C128 ROM `$430D`), which works on the line in
+/// place: from each character that isn't a digit, space or colon, it
+/// looks up the `$FE` keywords, then the `$CE` ones, then the one-byte
+/// ones, the first match in each table winning. Outside quotes, shifted
+/// characters are dropped (but π kept); `?` is PRINT; after REM nothing
+/// more is tokenized, after DATA nothing until a colon outside quotes.
+/// Returns the bytes and how many characters were dropped.
+pub fn crunch7(d: &Dialect, text: &[u8]) -> (Vec<u8>, usize) {
+    // CHRGOT: the character at `p`, past any spaces. CHRGET: the next.
+    fn got(buf: &[u8], p: &mut usize) -> u8 {
+        while buf.get(*p) == Some(&b' ') {
+            *p += 1;
+        }
+        buf.get(*p).copied().unwrap_or(0)
+    }
+    fn get(buf: &[u8], p: &mut usize) -> u8 {
+        *p += 1;
+        got(buf, p)
+    }
+    let main = d.table();
+    let prefixed: Vec<(u8, Vec<u8>)> = d.prefixed.iter().map(|&(p, k)| (p, table_of(k))).collect();
+    let mut buf = text.to_vec();
+    buf.push(0);
+    let mut dropped = 0;
+    let mut p = 0;
+    let mut c = got(&buf, &mut p);
+    'line: loop {
+        if c.is_ascii_digit() {
+            c = get(&buf, &mut p);
+            continue;
+        }
+        match c {
+            0 => break,
+            b':' | PI => {
+                c = get(&buf, &mut p);
+                continue;
+            }
+            0x80..=0xFE => {
+                buf.remove(p);
+                dropped += 1;
+                c = got(&buf, &mut p);
+                continue;
+            }
+            b'"' => loop {
+                c = get(&buf, &mut p);
+                if c == 0 {
+                    break 'line;
+                }
+                if c == b'"' {
+                    c = get(&buf, &mut p);
+                    continue 'line;
+                }
+            },
+            b'?' => {
+                buf[p] = PRINT;
+                c = get(&buf, &mut p);
+                continue;
+            }
+            _ => {}
+        }
+        for (prefix, table) in &prefixed {
+            if let Some((token, len)) = find_keyword(table, &buf[p..]) {
+                buf.splice(p..p + len, [*prefix, (token & 0x7F) + 2]);
+                get(&buf, &mut p);
+                c = get(&buf, &mut p);
+                continue 'line;
+            }
+        }
+        match find_keyword(&main, &buf[p..]) {
+            Some((REM, len)) => {
+                buf.splice(p..p + len, [REM]);
+                break;
+            }
+            Some((DATA, len)) => {
+                buf.splice(p..p + len, [DATA]);
+                get(&buf, &mut p);
+                // Past DATA's items: to a colon outside quotes, or the end.
+                let mut quoted = false;
+                while let Some(&ch) = buf.get(p).filter(|&&ch| ch != 0) {
+                    if ch == b'"' {
+                        quoted = !quoted;
+                    } else if ch == b':' && !quoted {
+                        break;
+                    }
+                    p += 1;
+                }
+                c = got(&buf, &mut p);
+            }
+            Some((token, len)) => {
+                buf.splice(p..p + len, [token]);
+                c = get(&buf, &mut p);
+            }
+            None => c = get(&buf, &mut p),
+        }
+    }
+    buf.truncate(buf.iter().position(|&b| b == 0).unwrap_or(buf.len()));
+    (buf, dropped)
 }
 
 /// The keyword at the start of `input`, as CRUNCH finds it: the token and
@@ -706,8 +1027,13 @@ pub fn encode(d: &Dialect, lines: &[Vec<u8>], meta: &FileMeta, load: u16) -> Enc
             program.remove(&number);
             continue;
         }
-        let text = if d.simons { simons_pass(&text) } else { text };
-        let (bytes, lost) = crunch(d, &text);
+        let (bytes, lost) = if d.basic7 {
+            crunch7(d, &text)
+        } else if d.simons {
+            crunch(d, &simons_pass(&text))
+        } else {
+            crunch(d, &text)
+        };
         if lost > 0 {
             dropped.push((number, index + 1, lost));
         }
@@ -781,6 +1107,12 @@ pub static C64_MEMORY: [Memory; 1] = [Memory {
     name: "C64",
     load_address: 0x0801,
     bytes_free: 38911,
+}];
+/// The C128's bank 0, which holds the program (FRE(0) in VICE).
+pub static C128_MEMORY: [Memory; 1] = [Memory {
+    name: "C128",
+    load_address: 0x1C01,
+    bytes_free: 58109,
 }];
 /// With the Simons' BASIC cartridge in (checked in VICE).
 pub static SIMONS_MEMORY: [Memory; 1] = [Memory {
@@ -881,6 +1213,10 @@ impl FileFormat for CbmBasic {
                     keep(&["vic20", "pet", "pet8032"]).unwrap_or("pet")
                 }
             }
+            0x1C01 => ["c128", "c128_80"]
+                .into_iter()
+                .find(|&id| id == current)
+                .unwrap_or("c128"),
             _ => return None,
         })
     }
@@ -1124,6 +1460,23 @@ mod vice {
         };
         assert!(simons.detect(file));
         assert!(!simons.detect(include_bytes!("../tests/data/c64-crunch.prg")));
+    }
+
+    #[test]
+    fn c128_basic7_matches_the_rom() {
+        let file = include_bytes!("../tests/data/c128-basic7.prg");
+        let text = include_str!("../tests/data/c128-basic7.txt");
+        let e = encode(&BASIC_7, &typed(text), &FileMeta::default(), 0x1C01);
+        assert_eq!(e.bytes, file);
+        let d = decode(&BASIC_7, file).unwrap();
+        assert_eq!(d.lines[1], b"20 BANK 15:PLAY \"CDEG\":SPRITE 1,1");
+        assert_eq!(d.lines[2], b"30 A=POT(1) XOR 3:DO WHILE A<5:A=A+1:LOOP");
+        assert_eq!(encode(&BASIC_7, &d.lines, &d.meta, 0x1C01).bytes, file);
+        let f = CbmBasic {
+            dialect: &BASIC_2,
+            memory: &C64_MEMORY,
+        };
+        assert_eq!(f.system_for(file, "c64"), Some("c128"));
     }
 
     #[test]

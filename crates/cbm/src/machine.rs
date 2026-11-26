@@ -102,6 +102,26 @@ pub fn code_for_char(c: char, mixed: bool, pound: bool) -> Option<u8> {
     })
 }
 
+/// The C128's 80-column codes: CHR$(2) and CHR$(130) underline on and
+/// off, CHR$(15) and CHR$(143) flash on and off, CHR$(14) and CHR$(142)
+/// the Mixed case and Graphics sets for what follows.
+const UNDERLINE_ON: u8 = 0x02;
+const UNDERLINE_OFF: u8 = 0x82;
+const FLASH_ON: u8 = 0x0F;
+const FLASH_OFF: u8 = 0x8F;
+
+fn vdc_effect(code: u8) -> Option<CodeEffect> {
+    Some(match code {
+        UNDERLINE_ON => CodeEffect::UnderlineOn,
+        UNDERLINE_OFF => CodeEffect::UnderlineOff,
+        FLASH_ON => CodeEffect::FlashOn,
+        FLASH_OFF => CodeEffect::FlashOff,
+        petscii::TO_MIXED_CASE => CodeEffect::Charset(MIXED_CASE),
+        petscii::TO_GRAPHICS => CodeEffect::Charset(0),
+        _ => return None,
+    })
+}
+
 impl Machine for Cbm {
     fn name(&self) -> &'static str {
         self.model.name
@@ -154,6 +174,11 @@ impl Machine for Cbm {
     /// and RVS ON/OFF. Other control codes ({CLR}, cursor codes...) are
     /// only shown.
     fn code_effect(&self, code: u8) -> Option<CodeEffect> {
+        if self.model.vdc
+            && let Some(e) = vdc_effect(code)
+        {
+            return Some(e);
+        }
         match code {
             petscii::RVS_ON => Some(CodeEffect::ReverseOn),
             petscii::RVS_OFF => Some(CodeEffect::ReverseOff),
@@ -170,6 +195,12 @@ impl Machine for Cbm {
             CodeEffect::Colour(n) => self.colour_codes().get(usize::from(n)).copied(),
             CodeEffect::ReverseOn => Some(petscii::RVS_ON),
             CodeEffect::ReverseOff => Some(petscii::RVS_OFF),
+            _ if !self.model.vdc => None,
+            CodeEffect::UnderlineOn => Some(UNDERLINE_ON),
+            CodeEffect::UnderlineOff => Some(UNDERLINE_OFF),
+            CodeEffect::FlashOn => Some(FLASH_ON),
+            CodeEffect::FlashOff => Some(FLASH_OFF),
+            CodeEffect::Charset(c) => self.charset_code(c),
         }
     }
 
@@ -426,6 +457,22 @@ mod tests {
         assert!(!m.narrow_pixels());
         assert!(Cbm::new(&model::PET8032).narrow_pixels());
         assert_eq!(Cbm::new(&model::PET8032).screen_columns(), 80);
+    }
+
+    #[test]
+    fn the_c128_80_column_codes() {
+        let m = Cbm::new(&model::C128_80);
+        assert_eq!(m.code_effect(0x02), Some(CodeEffect::UnderlineOn));
+        assert_eq!(m.code_effect(0x8F), Some(CodeEffect::FlashOff));
+        assert_eq!(m.code_effect(0x0E), Some(CodeEffect::Charset(MIXED_CASE)));
+        assert_eq!(m.code_effect(0x1C), Some(CodeEffect::Colour(2)));
+        assert_eq!(m.effect_code(CodeEffect::Charset(0)), Some(0x8E));
+        assert!(m.narrow_pixels());
+        // Not on the 40-column screen.
+        let m40 = Cbm::new(&model::C128_40);
+        assert_eq!(m40.code_effect(0x02), None);
+        assert_eq!(m40.code_effect(0x0E), None);
+        assert_eq!(m40.effect_code(CodeEffect::FlashOn), None);
     }
 
     #[test]

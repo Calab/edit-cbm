@@ -216,6 +216,15 @@ impl CbmKeyboard {
                 _ => {}
             }
         }
+        if self.model.keys == Keys::C128 {
+            match key {
+                Key::Escape if !mods.control => return insert(Some(crate::petscii::ESC)),
+                Key::Function(12) => return insert(Some(crate::petscii::HELP)),
+                Key::Tab if mods.control && mods.shift => return insert(Some(0x18)),
+                Key::Tab if mods.control => return insert(Some(crate::petscii::TAB)),
+                _ => {}
+            }
+        }
         if mods.control && !matches!(key, Key::Control(_)) {
             return insert(control_key_code(key, mods.shift));
         }
@@ -442,6 +451,31 @@ mod tests {
         assert_eq!(pet(Control('1'), true, false, false), EditAction::None);
         assert_eq!(pet(Function(1), true, false, false), EditAction::None);
         assert_eq!(pet(Down, true, false, false), EditAction::Insert(0x11));
+    }
+
+    #[test]
+    fn the_c128_extra_keys() {
+        let c128 = |k, control, shift| {
+            CbmKeyboard::new(&crate::model::C128_40).handle(KeyInput {
+                key: k,
+                mods: Mods {
+                    shift,
+                    control,
+                    commodore: false,
+                },
+            })
+        };
+        assert_eq!(c128(Escape, false, false), EditAction::Insert(0x1B));
+        assert_eq!(c128(Function(12), false, false), EditAction::Insert(0x84));
+        assert_eq!(c128(Tab, false, false), EditAction::NextTabStop);
+        assert_eq!(c128(Tab, true, false), EditAction::Insert(0x09));
+        // The C64's keys as before: CTRL+Esc is RUN/STOP, CTRL+F1 {F1}.
+        assert_eq!(c128(Escape, true, false), EditAction::Insert(0x03));
+        assert_eq!(c128(Function(1), true, false), EditAction::Insert(0x85));
+        assert_eq!(c128(Control('1'), true, false), EditAction::Insert(0x90));
+        // Esc and F12 do nothing on the C64.
+        assert_eq!(press(Escape), EditAction::None);
+        assert_eq!(press(Function(12)), EditAction::None);
     }
 
     #[test]

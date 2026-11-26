@@ -1,0 +1,10 @@
+10 graphic 1,1:color 0,1:print "hi";:a=1:score=2
+20 bank 15:play "cdeg":sprite 1,1
+30 a=pot(1) xor 3:do while a<5:a=a+1:loop
+40 if a then 10:else print
+50 data to,"x:y",aB:print
+60 rem graphic Bplay
+70 ?a:pR1:aB=1
+80 go to 10:goto10:fast:slow
+90 directory:dload"x":collision 1
+100 x=rgr(0)+rdot(1)+joy(1)

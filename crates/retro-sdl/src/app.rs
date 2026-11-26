@@ -3817,6 +3817,7 @@ impl App {
             Keycode::F6 => Key::Function(6),
             Keycode::F7 => Key::Function(7),
             Keycode::F8 => Key::Function(8),
+            Keycode::F12 => Key::Function(12),
             other => {
                 let code = other.into_i32();
                 let printable = (0x20..0x7F).contains(&code);

@@ -48,23 +48,35 @@ pub fn rgb((r, g, b): (u8, u8, u8)) -> Color {
     Color::RGB(r, g, b)
 }
 
-/// 16x16 grid of 8x8 glyphs, white on transparent, tinted when drawn.
+/// Two 16x16 grids of 8x8 glyphs, white on transparent, tinted when
+/// drawn: the character set in use, then below it the machine's other set
+/// (for the C128's 80-column screen, where each character has its own).
 pub fn build_atlas<'a>(
     creator: &'a TextureCreator<WindowContext>,
     machine: &dyn Machine,
 ) -> Result<Texture<'a>, String> {
     let mut tex = creator
-        .create_texture_static(PixelFormatEnum::RGBA32, 128, 128)
+        .create_texture_static(PixelFormatEnum::RGBA32, 128, 256)
         .map_err(|e| e.to_string())?;
-    let mut px = vec![0u8; 128 * 128 * 4];
-    for code in 0..=255u8 {
-        let g = machine.glyph(code);
-        let (gx, gy) = ((code as usize % 16) * 8, (code as usize / 16) * 8);
-        for (row, bits) in g.iter().enumerate() {
-            for col in 0..8 {
-                if bits & (0x80 >> col) != 0 {
-                    let i = ((gy + row) * 128 + gx + col) * 4;
-                    px[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+    let mut px = vec![0u8; 128 * 256 * 4];
+    let other = (machine.charset() + 1) % machine.charsets().len().max(1);
+    for half in 0..2 {
+        for code in 0..=255u8 {
+            let g = if half == 0 {
+                machine.glyph(code)
+            } else {
+                machine.charset_glyph(other, code)
+            };
+            let (gx, gy) = (
+                (code as usize % 16) * 8,
+                half * 128 + (code as usize / 16) * 8,
+            );
+            for (row, bits) in g.iter().enumerate() {
+                for col in 0..8 {
+                    if bits & (0x80 >> col) != 0 {
+                        let i = ((gy + row) * 128 + gx + col) * 4;
+                        px[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+                    }
                 }
             }
         }
@@ -98,6 +110,19 @@ impl Grid<'_, '_> {
         )
     }
 
+    /// Underline the cell at (col, row): its bottom pixel row.
+    pub fn underline(&mut self, col: usize, row: usize, color: Color) {
+        let r = self.rect(col, row, 1);
+        let h = (self.cell / 8).max(1);
+        self.canvas.set_draw_color(color);
+        let _ = self.canvas.fill_rect(Rect::new(
+            r.x(),
+            r.y() + (self.cell - h) as i32,
+            r.width(),
+            h,
+        ));
+    }
+
     pub fn fill(&mut self, col: usize, row: usize, cols: usize, color: Color) {
         let r = self.rect(col, row, cols);
         self.canvas.set_draw_color(color);
@@ -106,9 +131,15 @@ impl Grid<'_, '_> {
 
     /// Draw codes starting at (col, row) in `fg` (background untouched).
     pub fn codes(&mut self, col: usize, row: usize, codes: &[u8], fg: Color) {
+        self.codes_in(col, row, codes, fg, false);
+    }
+
+    /// The same, from the machine's other character set if `other`.
+    pub fn codes_in(&mut self, col: usize, row: usize, codes: &[u8], fg: Color, other: bool) {
         self.atlas.set_color_mod(fg.r, fg.g, fg.b);
+        let top = if other { 128 } else { 0 };
         for (i, &code) in codes.iter().enumerate() {
-            let src = Rect::new((code as i32 % 16) * 8, (code as i32 / 16) * 8, 8, 8);
+            let src = Rect::new((code as i32 % 16) * 8, top + (code as i32 / 16) * 8, 8, 8);
             let dst = self.rect(col + i, row, 1);
             let _ = self.canvas.copy(self.atlas, src, dst);
         }

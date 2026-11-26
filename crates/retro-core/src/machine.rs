@@ -53,6 +53,13 @@ pub enum CodeEffect {
     Colour(u8),
     ReverseOn,
     ReverseOff,
+    /// The C128's 80-column screen: underline, flash, and a character set
+    /// (an index into [`Machine::charsets`]) for the characters after it.
+    UnderlineOn,
+    UnderlineOff,
+    FlashOn,
+    FlashOff,
+    Charset(usize),
 }
 
 pub trait Machine {

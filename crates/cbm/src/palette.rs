@@ -49,6 +49,29 @@ pub const VIC20: [Colour; 16] = [
     ("Light yellow", (0xFF, 0xFF, 0xC9)),
 ];
 
+/// The C128's 80-column screen (the VDC; VICE's `vdc_deft.vpl`), by the
+/// C64's colour numbers: the colour codes pick VDC colours through the
+/// KERNAL's table at `$CE5C` (0, 15, 8, 7, 11, 4, 2, 13, 10, 12, 9, 6,
+/// 1, 5, 3, 14), so cyan is the VDC's light cyan, and so on.
+pub const VDC: [Colour; 16] = [
+    ("Black", (0x00, 0x00, 0x00)),
+    ("White", (0xFF, 0xFF, 0xFF)),
+    ("Dark red", (0xAA, 0x00, 0x00)),
+    ("Light cyan", (0x55, 0xFF, 0xFF)),
+    ("Light purple", (0xFF, 0x55, 0xFF)),
+    ("Dark green", (0x00, 0xAA, 0x00)),
+    ("Dark blue", (0x00, 0x00, 0xAA)),
+    ("Yellow", (0xFF, 0xFF, 0x55)),
+    ("Dark purple", (0xAA, 0x00, 0xAA)),
+    ("Brown", (0xAA, 0x55, 0x00)),
+    ("Light red", (0xFF, 0x55, 0x55)),
+    ("Dark cyan", (0x00, 0xAA, 0xAA)),
+    ("Medium grey", (0x55, 0x55, 0x55)),
+    ("Light green", (0x55, 0xFF, 0x55)),
+    ("Light blue", (0x55, 0x55, 0xFF)),
+    ("Light grey", (0xAA, 0xAA, 0xAA)),
+];
+
 /// The PET's screen: green phosphor on black (VICE's `green.vpl`).
 pub const PET: [Colour; 2] = [("Black", (0x00, 0x00, 0x00)), ("Green", (0x41, 0xFF, 0x00))];
 
@@ -76,6 +99,14 @@ pub fn vic20_rgb(colour: u8, _lum: u8) -> (u8, u8, u8) {
 
 pub fn vic20_label(colour: u8, _lum: u8) -> String {
     label(&VIC20, colour)
+}
+
+pub fn vdc_rgb(colour: u8, _lum: u8) -> (u8, u8, u8) {
+    rgb(&VDC, colour)
+}
+
+pub fn vdc_label(colour: u8, _lum: u8) -> String {
+    label(&VDC, colour)
 }
 
 pub fn pet_rgb(colour: u8, _lum: u8) -> (u8, u8, u8) {

@@ -18,6 +18,10 @@ pub const COLOUR_CODES: [u8; 16] = [
     0x90, 0x05, 0x1C, 0x9F, 0x9C, 0x1E, 0x1F, 0x9E, 0x81, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B,
 ];
 pub const RVS_ON: u8 = 0x12;
+/// The C128's ESC, TAB and HELP keys' codes.
+pub const ESC: u8 = 0x1B;
+pub const TAB: u8 = 0x09;
+pub const HELP: u8 = 0x84;
 /// Switch the screen to the Mixed case set (CTRL+N), or back to Graphics.
 pub const TO_MIXED_CASE: u8 = 0x0E;
 pub const TO_GRAPHICS: u8 = 0x8E;

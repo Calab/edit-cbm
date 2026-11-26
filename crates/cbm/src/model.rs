@@ -14,6 +14,9 @@ pub enum Keys {
     /// The PET's full-size graphics keyboard: no CTRL or C= key; Shift
     /// with any key types a graphic; RVS is a key of its own.
     PetGraphics,
+    /// As the C64's, with the C128's extra keys: ESC (Esc), HELP (F12),
+    /// TAB (CTRL+Tab types it; Tab moves to the next tab stop).
+    C128,
 }
 
 pub struct Model {
@@ -38,6 +41,9 @@ pub struct Model {
     pub rom_reversed: bool,
     /// No colour choice: the screen is always `text` on `background`.
     pub fixed_colours: bool,
+    /// The C128's 80-column chip: each character has its own underline,
+    /// flash and character set, set by codes in the text.
+    pub vdc: bool,
     /// The file formats it reads and writes.
     pub formats: &'static [&'static dyn FileFormat],
     /// The development character ROM's name in `fonts-dev`.
@@ -73,6 +79,7 @@ pub static C64: Model = Model {
     narrow: false,
     rom_reversed: true,
     fixed_colours: false,
+    vdc: false,
     formats: crate::C64_FORMATS,
     rom_file: "c64-chargen.bin",
     colours: &palette::C64,
@@ -98,6 +105,7 @@ pub static VIC20: Model = Model {
     narrow: false,
     rom_reversed: true,
     fixed_colours: false,
+    vdc: false,
     formats: crate::VIC20_FORMATS,
     rom_file: "vic20-chargen.bin",
     colours: &palette::VIC20,
@@ -125,6 +133,7 @@ const PET_40: Model = Model {
     narrow: false,
     rom_reversed: false,
     fixed_colours: true,
+    vdc: false,
     formats: crate::PET_FORMATS,
     rom_file: "pet-chargen.bin",
     colours: &palette::PET,
@@ -147,5 +156,55 @@ pub static PET8032: Model = Model {
     ..PET_40
 };
 
+/// The C128 on its 40-column screen (the VIC-II, as the C64's): light
+/// green on dark grey with a light green border at power-on; the C64's
+/// characters (the first half of the C128's character ROM). Its logical
+/// line is 2 rows of 40.
+pub static C128_40: Model = C128_40_MODEL;
+
+const C128_40_MODEL: Model = Model {
+    id: "c128",
+    name: "C128",
+    columns: 40,
+    logical_line: 80,
+    colour_codes: 16,
+    keys: Keys::C128,
+    pound: true,
+    narrow: false,
+    rom_reversed: true,
+    fixed_colours: false,
+    vdc: false,
+    formats: crate::C128_FORMATS,
+    rom_file: "c128-chargen.bin",
+    colours: &palette::C64,
+    rgb: palette::c64_rgb,
+    label: palette::c64_label,
+    character_colours: 16,
+    border_colours: 16,
+    text: 13,
+    background: 11,
+    border: 13,
+};
+
+/// The C128 on its 80-column screen (the VDC): light cyan on black at
+/// power-on (cyan, colour 3, is the VDC's light cyan); narrow characters;
+/// underline, flash and the character set per character. Its logical
+/// line is 2 rows of 80.
+pub static C128_80: Model = Model {
+    id: "c128_80",
+    name: "C128 80",
+    columns: 80,
+    logical_line: 160,
+    narrow: true,
+    vdc: true,
+    colours: &palette::VDC,
+    rgb: palette::vdc_rgb,
+    label: palette::vdc_label,
+    text: 3,
+    background: 0,
+    border: 0,
+    ..C128_40_MODEL
+};
+
 /// Every model, in menu order.
-pub static MODELS: [&Model; 4] = [&C64, &VIC20, &PET, &PET8032];
+pub static MODELS: [&Model; 6] = [&C64, &VIC20, &PET, &PET8032, &C128_40, &C128_80];

@@ -307,6 +307,8 @@ impl App {
         };
         // Colour and reverse, carried from line to line.
         let mut state = Attr::default();
+        let flash_on = self.cursor_visible();
+        let current_set = machine.charset();
         let mut cursor_look = Attr::default();
         let mut row = 0usize; // absolute screen row of the current line's first row
         for (i, line) in doc.lines().iter().enumerate() {
@@ -371,11 +373,21 @@ impl App {
                     } else {
                         colour(look)
                     };
-                    if look.reverse {
+                    // Flashing characters (C128 80 columns) show in step
+                    // with the cursor.
+                    if look.flash && !flash_on {
+                        continue;
+                    }
+                    let other = look.charset.is_some_and(|s| s != current_set);
+                    let (glyph_ink, line_ink) = if look.reverse {
                         grid.fill(x, screen, 1, ink);
-                        grid.codes(x, screen, &[code], bg);
+                        (bg, bg)
                     } else {
-                        grid.codes(x, screen, &[code], ink);
+                        (ink, ink)
+                    };
+                    grid.codes_in(x, screen, &[code], glyph_ink, other);
+                    if look.underline {
+                        grid.underline(x, screen, line_ink);
                     }
                 }
                 // A selected line end shows as one selected cell.

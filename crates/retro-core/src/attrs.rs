@@ -23,6 +23,10 @@ pub struct Attr {
     /// A colour number, or `None` for the screen's text colour.
     pub colour: Option<u8>,
     pub reverse: bool,
+    pub underline: bool,
+    pub flash: bool,
+    /// A character set, or `None` for the window's.
+    pub charset: Option<usize>,
 }
 
 impl Attr {
@@ -31,6 +35,11 @@ impl Attr {
             CodeEffect::Colour(c) => self.colour = Some(c),
             CodeEffect::ReverseOn => self.reverse = true,
             CodeEffect::ReverseOff => self.reverse = false,
+            CodeEffect::UnderlineOn => self.underline = true,
+            CodeEffect::UnderlineOff => self.underline = false,
+            CodeEffect::FlashOn => self.flash = true,
+            CodeEffect::FlashOff => self.flash = false,
+            CodeEffect::Charset(c) => self.charset = Some(c),
         }
     }
 }
@@ -65,7 +74,11 @@ fn scan(machine: &dyn Machine, line: &[u8], start: Attr) -> (Vec<Attr>, Attr, Op
         }
         let mut look = *state;
         if machine.is_control(b) {
+            // A code always looks like a code.
             look.reverse = false;
+            look.underline = false;
+            look.flash = false;
+            look.charset = None;
         }
         out.push(look);
     }
@@ -123,13 +136,26 @@ pub fn codes_between(
     {
         out.push(c);
     }
+    let flag = |on: bool, yes: CodeEffect, no: CodeEffect| if on { yes } else { no };
     if from.reverse != to.reverse {
-        let e = if to.reverse {
-            CodeEffect::ReverseOn
-        } else {
-            CodeEffect::ReverseOff
-        };
+        let e = flag(to.reverse, CodeEffect::ReverseOn, CodeEffect::ReverseOff);
         out.extend(machine.effect_code(e));
+    }
+    if from.underline != to.underline {
+        let e = flag(
+            to.underline,
+            CodeEffect::UnderlineOn,
+            CodeEffect::UnderlineOff,
+        );
+        out.extend(machine.effect_code(e));
+    }
+    if from.flash != to.flash {
+        let e = flag(to.flash, CodeEffect::FlashOn, CodeEffect::FlashOff);
+        out.extend(machine.effect_code(e));
+    }
+    if from.charset != to.charset {
+        let set = to.charset.unwrap_or(machine.charset());
+        out.extend(machine.effect_code(CodeEffect::Charset(set)));
     }
     out
 }
@@ -186,6 +212,7 @@ mod tests {
                 CodeEffect::Colour(c) => c,
                 CodeEffect::ReverseOn => 4,
                 CodeEffect::ReverseOff => 5,
+                _ => return None,
             })
         }
     }
@@ -251,7 +278,8 @@ mod tests {
             at(0, 2),
             Attr {
                 colour: Some(1),
-                reverse: false
+                reverse: false,
+                ..Attr::default()
             }
         );
         // Inside the string: its colour.
@@ -261,7 +289,8 @@ mod tests {
             state_after(&M, &text, at(0, 4)),
             Attr {
                 colour: Some(3),
-                reverse: false
+                reverse: false,
+                ..Attr::default()
             }
         );
     }
@@ -271,10 +300,12 @@ mod tests {
         let red = Attr {
             colour: Some(2),
             reverse: false,
+            ..Attr::default()
         };
         let rvs = Attr {
             colour: None,
             reverse: true,
+            ..Attr::default()
         };
         assert_eq!(codes_between(&M, red, red, None), b"");
         assert_eq!(codes_between(&M, Attr::default(), red, None), [2]);
